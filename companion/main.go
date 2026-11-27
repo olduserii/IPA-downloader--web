@@ -19,17 +19,68 @@ import (
 	"github.com/majd/ipatool/v2/pkg/util/operatingsystem"
 )
 
-// memoryKeychain keeps credentials strictly in RAM for the duration of a single request.
+// memoryCookieJar wraps net/http/cookiejar to satisfy ipatool's pkg/http.CookieJar interface.
+type memoryCookieJar struct {
+	*cookiejar.Jar
+}
+
+func (m *memoryCookieJar) Save() error {
+	return nil
+}
+
+// memoryKeychain keeps credentials strictly in RAM and never writes passwords to disk.
+// Machine-level anisette provisioning state ("anisette-v4") is optionally shared in RAM
+// across logins so subsequent requests skip slow re-provisioning.
 type memoryKeychain struct {
+	mu           sync.RWMutex
+	data         map[string][]byte
+	sharedDevice *sharedAnisetteStore
+}
+
+type sharedAnisetteStore struct {
 	mu   sync.RWMutex
 	data map[string][]byte
 }
 
+func newSharedAnisetteStore() *sharedAnisetteStore {
+	return &sharedAnisetteStore{data: make(map[string][]byte)}
+}
+
+func (s *sharedAnisetteStore) Get(key string) ([]byte, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	val, ok := s.data[key]
+	if !ok {
+		return nil, false
+	}
+	cp := make([]byte, len(val))
+	copy(cp, val)
+	return cp, true
+}
+
+func (s *sharedAnisetteStore) Set(key string, val []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cp := make([]byte, len(val))
+	copy(cp, val)
+	s.data[key] = cp
+}
+
+var globalAnisette = newSharedAnisetteStore()
+
 func newMemoryKeychain() *memoryKeychain {
-	return &memoryKeychain{data: make(map[string][]byte)}
+	return &memoryKeychain{
+		data:         make(map[string][]byte),
+		sharedDevice: globalAnisette,
+	}
 }
 
 func (m *memoryKeychain) Get(key string) ([]byte, error) {
+	if key == "anisette-v4" && m.sharedDevice != nil {
+		if val, ok := m.sharedDevice.Get(key); ok {
+			return val, nil
+		}
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	val, ok := m.data[key]
@@ -42,6 +93,10 @@ func (m *memoryKeychain) Get(key string) ([]byte, error) {
 }
 
 func (m *memoryKeychain) Set(key string, val []byte) error {
+	if key == "anisette-v4" && m.sharedDevice != nil {
+		m.sharedDevice.Set(key, val)
+		return nil
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	cp := make([]byte, len(val))
@@ -57,13 +112,61 @@ func (m *memoryKeychain) Remove(key string) error {
 	return nil
 }
 
+type pendingAuthEntry struct {
+	store     appstore.AppStore
+	guid      string
+	expiresAt time.Time
+}
+
+type pendingAuthCache struct {
+	mu      sync.Mutex
+	entries map[string]pendingAuthEntry
+}
+
+func newPendingAuthCache() *pendingAuthCache {
+	return &pendingAuthCache{entries: make(map[string]pendingAuthEntry)}
+}
+
+func (c *pendingAuthCache) Get(email string) (appstore.AppStore, string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	for k, v := range c.entries {
+		if now.After(v.expiresAt) {
+			delete(c.entries, k)
+		}
+	}
+	entry, ok := c.entries[strings.ToLower(strings.TrimSpace(email))]
+	if !ok {
+		return nil, "", false
+	}
+	return entry.store, entry.guid, true
+}
+
+func (c *pendingAuthCache) Put(email string, store appstore.AppStore, guid string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[strings.ToLower(strings.TrimSpace(email))] = pendingAuthEntry{
+		store:     store,
+		guid:      guid,
+		expiresAt: time.Now().Add(5 * time.Minute),
+	}
+}
+
+func (c *pendingAuthCache) Delete(email string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.entries, strings.ToLower(strings.TrimSpace(email)))
+}
+
 func newEphemeralStore() (appstore.AppStore, string, error) {
 	osSvc := operatingsystem.New()
 	mach := machine.New(machine.Args{OS: osSvc})
-	jar, err := cookiejar.New(nil)
+	rawJar, err := cookiejar.New(nil)
 	if err != nil {
 		return nil, "", err
 	}
+	jar := &memoryCookieJar{Jar: rawJar}
 	store := appstore.NewAppStore(appstore.Args{
 		CookieJar:       jar,
 		OperatingSystem: osSvc,
@@ -119,6 +222,7 @@ func main() {
 		port = "8080"
 	}
 	bridgeSecret := strings.TrimSpace(os.Getenv("BRIDGE_SECRET"))
+	pending2FA := newPendingAuthCache()
 
 	mux := http.NewServeMux()
 
@@ -140,18 +244,37 @@ func main() {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"status": "error", "message": "Invalid JSON body"})
 			return
 		}
-		store, guid, err := newEphemeralStore()
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"status": "error", "message": err.Error()})
-			return
+
+		email := strings.TrimSpace(req.Email)
+		code := strings.TrimSpace(req.Code)
+
+		var (
+			store appstore.AppStore
+			guid  string
+			err   error
+		)
+		if code != "" {
+			if cachedStore, cachedGuid, ok := pending2FA.Get(email); ok {
+				store = cachedStore
+				guid = cachedGuid
+			}
 		}
+		if store == nil {
+			store, guid, err = newEphemeralStore()
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"status": "error", "message": err.Error()})
+				return
+			}
+		}
+
 		out, err := store.Login(appstore.LoginInput{
-			Email:    strings.TrimSpace(req.Email),
+			Email:    email,
 			Password: req.Password,
-			AuthCode: strings.TrimSpace(req.Code),
+			AuthCode: code,
 		})
 		if err != nil {
 			if errors.Is(err, appstore.ErrAuthCodeRequired) {
+				pending2FA.Put(email, store, guid)
 				writeJSON(w, http.StatusOK, map[string]any{
 					"status":  "requires2fa",
 					"guid":    guid,
@@ -165,6 +288,9 @@ func main() {
 			})
 			return
 		}
+
+		pending2FA.Delete(email)
+
 		// Never echo the raw Apple ID password back over HTTP
 		acc := out.Account
 		acc.Password = ""
