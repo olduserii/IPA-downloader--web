@@ -15,7 +15,7 @@ RUN mkdir -p /src/ipatool/cmd/bridge
 COPY main.go /src/ipatool/cmd/bridge/main.go
 
 WORKDIR /src/ipatool
-RUN CGO_ENABLED=0 go build -o /out/sap-bridge ./cmd/bridge
+RUN CGO_ENABLED=1 go build -o /out/sap-bridge ./cmd/bridge
 
 FROM debian:bookworm-slim
 
