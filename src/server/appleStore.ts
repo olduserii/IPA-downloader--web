@@ -3,6 +3,12 @@ import type { AuthLoginResponse, DownloadDescriptorResult } from '../shared/type
 import { fetchAnisetteWithFailover, mapAnisetteAuthHeaders } from './anisette.ts';
 import { buildPlist, parsePlist, type PlistValue } from './plist.ts';
 import {
+  bridgeInspectDownload,
+  bridgeLoginAppleId,
+  bridgePurchaseFreeLicense,
+  resolveBridgeConfig,
+} from './companion.ts';
+import {
   assertAppleCdnUrl,
   encryptSessionToken,
   isValidAppId,
@@ -241,6 +247,8 @@ export interface AuthenticateOptions {
   existingGuid?: string;
   preferredAuthEndpoint?: string;
   persistMode?: '24h' | 'keep' | 'memory';
+  bridgeUrl?: string;
+  bridgeSecret?: string;
 }
 
 export async function authenticateAppleId(
@@ -250,6 +258,7 @@ export async function authenticateAppleId(
     guid?: string;
     authEndpoint?: string;
     rawSession?: StoredAppleSession;
+    requiresSapBridge?: boolean;
   }
 > {
   const email = opts.email.trim();
@@ -261,6 +270,31 @@ export async function authenticateAppleId(
     return {
       status: 'error',
       message: 'Введите корректный Apple ID (e-mail) и пароль.',
+    };
+  }
+
+  // If FairPlay SAP Bridge is configured (via SAP_BRIDGE_URL env or UI settings),
+  // use it for full CoreFP / Unicorn ARM64 X-Apple-ActionSignature authentication.
+  try {
+    const bridge = resolveBridgeConfig({
+      bridgeUrl: opts.bridgeUrl,
+      bridgeSecret: opts.bridgeSecret,
+    });
+    if (bridge) {
+      return await bridgeLoginAppleId(bridge, {
+        email,
+        password,
+        code,
+        persistMode,
+      });
+    }
+  } catch (err) {
+    return {
+      status: 'error',
+      message:
+        err instanceof Error
+          ? `Ошибка FairPlay SAP Bridge: ${err.message}`
+          : 'Не удалось подключиться к FairPlay SAP Bridge.',
     };
   }
 
@@ -501,8 +535,9 @@ export async function authenticateAppleId(
   if (sawEmptyOrForbidden) {
     return {
       status: 'error',
+      requiresSapBridge: true,
       message:
-        'Сервер Apple отклонил прямой вход с облачного IP (HTTP 403 / пустой ответ — Apple требует FairPlay SAP-подпись устройства). Вы можете переключить сервер Anisette или войти мгновенно через вкладку «Вход по сессии» с токеном из ipatool / IPA Vault.',
+        'Apple заблокировал прямой вход без криптографической подписи FairPlay SAP (CoreFP / X-Apple-ActionSignature). Серверы SideStore Anisette её не выдают и Vercel Serverless не может запускать нативный эмулятор CoreFP. Подключите FairPlay SAP Bridge (блок справа) или войдите через вкладку «Вход по сессии».',
     };
   }
 
@@ -575,13 +610,39 @@ async function headContentLength(url: string): Promise<number | undefined> {
 export async function fetchDownloadDescriptor(
   session: StoredAppleSession,
   appID: string,
-  externalVersionID = ''
+  externalVersionID = '',
+  bridgeOverride?: { bridgeUrl?: string; bridgeSecret?: string }
 ): Promise<DownloadDescriptorResult> {
   if (!isValidAppId(appID)) {
     throw new AppleStoreError('invalidResponse', 'Некорректный App ID');
   }
   if (externalVersionID && !isValidVersionId(externalVersionID)) {
     throw new AppleStoreError('invalidResponse', 'Некорректный External Version ID');
+  }
+
+  const bridge = resolveBridgeConfig(bridgeOverride);
+  if (bridge) {
+    try {
+      return await bridgeInspectDownload(bridge, session, appID, externalVersionID);
+    } catch (err) {
+      const code = (err as Error & { bridgeCode?: string })?.bridgeCode;
+      if (code === 'sessionExpired') {
+        throw new AppleStoreError(
+          'sessionExpired',
+          'Сессия Apple ID истекла — выполните повторный вход на вкладке «Аккаунт».'
+        );
+      }
+      if (code === 'licenseRequired') {
+        throw new AppleStoreError(
+          'licenseRequired',
+          'Нет лицензии на этом Apple ID. Нажмите «Приобрести бесплатную лицензию» или используйте аккаунт, на котором приложение уже скачивалось ранее.'
+        );
+      }
+      throw new AppleStoreError(
+        'unavailable',
+        err instanceof Error ? err.message : 'Ошибка FairPlay SAP Bridge при получении IPA.'
+      );
+    }
   }
 
   const podPrefix = session.pod ? `p${session.pod}-` : '';
@@ -750,10 +811,30 @@ export async function fetchDownloadDescriptor(
 
 export async function purchaseFreeLicense(
   session: StoredAppleSession,
-  appID: string
+  appID: string,
+  bridgeOverride?: { bridgeUrl?: string; bridgeSecret?: string }
 ): Promise<{ ok: boolean; message: string }> {
   if (!isValidAppId(appID)) {
     throw new AppleStoreError('invalidResponse', 'Некорректный App ID');
+  }
+
+  const bridge = resolveBridgeConfig(bridgeOverride);
+  if (bridge) {
+    try {
+      return await bridgePurchaseFreeLicense(bridge, session, appID);
+    } catch (err) {
+      const code = (err as Error & { bridgeCode?: string })?.bridgeCode;
+      if (code === 'sessionExpired') {
+        throw new AppleStoreError(
+          'sessionExpired',
+          'Сессия Apple ID истекла — выполните повторный вход.'
+        );
+      }
+      throw new AppleStoreError(
+        'unavailable',
+        err instanceof Error ? err.message : 'Ошибка добавления лицензии через FairPlay SAP Bridge.'
+      );
+    }
   }
 
   const podPrefix = session.pod ? `p${session.pod}-` : '';

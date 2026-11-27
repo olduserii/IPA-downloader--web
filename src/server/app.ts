@@ -22,6 +22,11 @@ import {
   searchITunesCatalog,
   syncPopularAppsListFromGitHub,
 } from './catalog.ts';
+import {
+  getEnvBridgeConfig,
+  resolveBridgeConfig,
+  testBridgeConnection,
+} from './companion.ts';
 import { buildOtaManifestPlist } from './plist.ts';
 import {
   clearBrowserSessionCookies,
@@ -58,6 +63,24 @@ function toSummary(s: StoredAppleSession): AppleSessionSummary {
 function normalizePersistMode(raw: unknown): SessionPersistMode {
   if (raw === 'keep' || raw === 'memory' || raw === '24h') return raw;
   return '24h';
+}
+
+function extractBridgeOverride(req: Request): { bridgeUrl?: string; bridgeSecret?: string } {
+  const hdrUrl =
+    typeof req.headers['x-sap-bridge-url'] === 'string'
+      ? req.headers['x-sap-bridge-url'].trim()
+      : undefined;
+  const hdrSecret =
+    typeof req.headers['x-sap-bridge-secret'] === 'string'
+      ? req.headers['x-sap-bridge-secret'].trim()
+      : undefined;
+  const bodyUrl = typeof req.body?.bridgeUrl === 'string' ? req.body.bridgeUrl.trim() : undefined;
+  const bodySecret =
+    typeof req.body?.bridgeSecret === 'string' ? req.body.bridgeSecret.trim() : undefined;
+  return {
+    bridgeUrl: bodyUrl || hdrUrl || undefined,
+    bridgeSecret: bodySecret || hdrSecret || undefined,
+  };
 }
 
 interface ResolvedAuth {
@@ -203,6 +226,40 @@ export function createApiRouter(): express.Router {
     }
   });
 
+  // --- FairPlay SAP Bridge Status & Test ---
+  router.get('/bridge/status', (_req, res) => {
+    const envBridge = getEnvBridgeConfig();
+    res.json({
+      configured: Boolean(envBridge),
+      source: envBridge ? 'env' : 'none',
+    });
+  });
+
+  router.post('/bridge/test', async (req, res) => {
+    if (!verifyCsrfOnMutation(req)) {
+      res.status(403).json({ ok: false, error: 'Запрос отклонён проверкой источника' });
+      return;
+    }
+    try {
+      const override = extractBridgeOverride(req);
+      const config = resolveBridgeConfig(override);
+      if (!config) {
+        res.status(400).json({
+          ok: false,
+          error: 'Укажите HTTPS-адрес FairPlay SAP Bridge или задайте SAP_BRIDGE_URL в Vercel.',
+        });
+        return;
+      }
+      const result = await testBridgeConnection(config);
+      res.status(result.ok ? 200 : 400).json(result);
+    } catch (err) {
+      res.status(400).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Некорректный адрес FairPlay SAP Bridge',
+      });
+    }
+  });
+
   // --- Apple ID Authentication (Automatic 24h Browser Cookie Cache + Stateless Bearer) ---
   router.post('/auth/login', async (req, res) => {
     try {
@@ -219,6 +276,7 @@ export function createApiRouter(): express.Router {
           ? req.body.authEndpoint.trim()
           : undefined;
       const persistMode = normalizePersistMode(req.body?.persistMode);
+      const bridgeOverride = extractBridgeOverride(req);
 
       const result = await authenticateAppleId({
         email,
@@ -229,6 +287,8 @@ export function createApiRouter(): express.Router {
         existingGuid,
         preferredAuthEndpoint,
         persistMode,
+        bridgeUrl: bridgeOverride.bridgeUrl,
+        bridgeSecret: bridgeOverride.bridgeSecret,
       });
 
       if (result.status === 'authenticated' && result.rawSession) {
@@ -252,6 +312,7 @@ export function createApiRouter(): express.Router {
         guid: result.guid,
         authEndpoint: result.authEndpoint,
         anisetteUsed: result.anisetteUsed,
+        requiresSapBridge: result.requiresSapBridge,
         message: result.message,
       });
     } catch (err) {
@@ -450,7 +511,13 @@ export function createApiRouter(): express.Router {
     }
 
     try {
-      const descriptor = await fetchDownloadDescriptor(session, appID, externalVersionID);
+      const bridgeOverride = extractBridgeOverride(req);
+      const descriptor = await fetchDownloadDescriptor(
+        session,
+        appID,
+        externalVersionID,
+        bridgeOverride
+      );
 
       const publicById = new Map(publicHistory.map((v) => [v.externalVersionID, v]));
       const mergedMap = new Map<string, AppVersionEntry>();
@@ -527,7 +594,8 @@ export function createApiRouter(): express.Router {
     }
 
     try {
-      const result = await purchaseFreeLicense(resolved.session, appID);
+      const bridgeOverride = extractBridgeOverride(req);
+      const result = await purchaseFreeLicense(resolved.session, appID, bridgeOverride);
       res.json(result);
     } catch (err) {
       const storeErr = err instanceof AppleStoreError ? err : null;
@@ -560,6 +628,7 @@ export function createApiRouter(): express.Router {
     const icons: Record<string, string> = {};
     let sessionExpired = false;
 
+    const bridgeOverride = extractBridgeOverride(req);
     const concurrency = 4;
     for (let i = 0; i < ids.length; i += concurrency) {
       if (sessionExpired) break;
@@ -567,7 +636,7 @@ export function createApiRouter(): express.Router {
       await Promise.all(
         chunk.map(async (id) => {
           try {
-            const desc = await fetchDownloadDescriptor(session, id);
+            const desc = await fetchDownloadDescriptor(session, id, '', bridgeOverride);
             statuses[id] = 'owned';
             if (desc.iconURL) icons[id] = desc.iconURL;
           } catch (err) {

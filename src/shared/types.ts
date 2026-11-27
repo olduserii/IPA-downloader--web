@@ -70,6 +70,19 @@ export interface AnisetteTestResult {
   error?: string;
 }
 
+export interface BridgeStatusResponse {
+  configured: boolean;
+  source: 'env' | 'none';
+}
+
+export interface BridgeTestResult {
+  ok: boolean;
+  engine?: string;
+  latencyMs?: number;
+  secretProtected?: boolean;
+  error?: string;
+}
+
 export type SessionPersistMode = '24h' | 'keep' | 'memory';
 
 export interface AppleSessionSummary {

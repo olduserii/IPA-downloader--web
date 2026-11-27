@@ -21,16 +21,21 @@ import { type ChangeEvent, type FormEvent, useEffect, useRef, useState } from 'r
 import {
   apiFetchAnisetteServers,
   apiGenerateSessionToken,
+  apiGetBridgeStatus,
   apiLoginAppleId,
   apiLoginWithSessionToken,
   apiTestAnisette,
+  apiTestBridge,
   apiUpdateSessionPolicy,
   downloadTextFile,
+  getSavedBridgeConfig,
+  saveBridgeConfig,
 } from '../lib/api.ts';
 import type {
   AnisetteServer,
   AnisetteTestResult,
   AppleSessionSummary,
+  BridgeTestResult,
   SessionPersistMode,
 } from '../shared/types.ts';
 
@@ -78,6 +83,7 @@ export function AccountView({
   const [loginPersistMode, setLoginPersistMode] = useState<SessionPersistMode>('24h');
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [authError, setAuthError] = useState('');
+  const [authNeedsSapBridge, setAuthNeedsSapBridge] = useState(false);
   const [authInfo, setAuthInfo] = useState('');
 
   // Login via generated session token ("Вход по сессии")
@@ -100,6 +106,13 @@ export function AccountView({
   const [copiedGen, setCopiedGen] = useState(false);
   const [policyMessage, setPolicyMessage] = useState('');
 
+  // FairPlay SAP Bridge state
+  const [envBridgeConfigured, setEnvBridgeConfigured] = useState(false);
+  const [bridgeUrl, setBridgeUrl] = useState(() => getSavedBridgeConfig().bridgeUrl);
+  const [bridgeSecret, setBridgeSecret] = useState(() => getSavedBridgeConfig().bridgeSecret);
+  const [isTestingBridge, setIsTestingBridge] = useState(false);
+  const [bridgeResult, setBridgeResult] = useState<BridgeTestResult | null>(null);
+
   // SideStore Anisette state
   const [useAnisette, setUseAnisette] = useState(true);
   const [servers, setServers] = useState<AnisetteServer[]>([]);
@@ -109,6 +122,12 @@ export function AccountView({
   const [anisetteResult, setAnisetteResult] = useState<AnisetteTestResult | null>(null);
 
   useEffect(() => {
+    apiGetBridgeStatus()
+      .then((st) => setEnvBridgeConfigured(Boolean(st.configured)))
+      .catch(() => {
+        // ignore
+      });
+
     apiFetchAnisetteServers()
       .then((list) => {
         setServers(list);
@@ -142,11 +161,30 @@ export function AccountView({
     }
   };
 
+  const handleTestBridge = async () => {
+    saveBridgeConfig(bridgeUrl, bridgeSecret);
+    setIsTestingBridge(true);
+    setBridgeResult(null);
+    try {
+      const res = await apiTestBridge(bridgeUrl || undefined, bridgeSecret || undefined);
+      setBridgeResult(res);
+    } catch (err) {
+      setBridgeResult({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Ошибка подключения к FairPlay SAP Bridge',
+      });
+    } finally {
+      setIsTestingBridge(false);
+    }
+  };
+
   const handleCredentialsLogin = async (e: FormEvent) => {
     e.preventDefault();
     setAuthError('');
+    setAuthNeedsSapBridge(false);
     setAuthInfo('');
     setIsLoggingIn(true);
+    saveBridgeConfig(bridgeUrl, bridgeSecret);
 
     try {
       const res = await apiLoginAppleId({
@@ -158,6 +196,8 @@ export function AccountView({
         guid: pendingGuid,
         authEndpoint: pendingAuthEndpoint,
         persistMode: loginPersistMode,
+        bridgeUrl: bridgeUrl.trim() || undefined,
+        bridgeSecret: bridgeSecret.trim() || undefined,
       });
 
       if (res.status === 'requires2fa') {
@@ -177,10 +217,12 @@ export function AccountView({
         setRequires2FA(false);
         setPendingGuid(undefined);
         setPendingAuthEndpoint(undefined);
+        setAuthNeedsSapBridge(false);
         onAuthenticated(res.token, res.session);
         return;
       }
 
+      setAuthNeedsSapBridge(Boolean(res.requiresSapBridge));
       setAuthError(res.message || 'Не удалось выполнить вход в Apple ID.');
     } catch (err) {
       setAuthError(err instanceof Error ? err.message : 'Ошибка соединения с сервером');
@@ -744,10 +786,27 @@ export function AccountView({
                     {authError && (
                       <div
                         role="alert"
-                        className="p-3.5 rounded-xl bg-rose-50 dark:bg-rose-950/35 border border-rose-200 dark:border-rose-900/60 flex items-start gap-2.5 text-xs text-rose-800 dark:text-rose-200"
+                        className="p-3.5 rounded-xl bg-rose-50 dark:bg-rose-950/35 border border-rose-200 dark:border-rose-900/60 space-y-2.5 text-xs text-rose-800 dark:text-rose-200"
                       >
-                        <AlertCircle className="w-4 h-4 text-rose-600 dark:text-rose-400 shrink-0 mt-0.5" />
-                        <span>{authError}</span>
+                        <div className="flex items-start gap-2.5">
+                          <AlertCircle className="w-4 h-4 text-rose-600 dark:text-rose-400 shrink-0 mt-0.5" />
+                          <span className="leading-relaxed">{authError}</span>
+                        </div>
+                        {authNeedsSapBridge && (
+                          <div className="pl-6 flex flex-wrap items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setLoginTab('session');
+                                setAuthError('');
+                                setAuthNeedsSapBridge(false);
+                              }}
+                              className="min-h-[34px] px-3 py-1 rounded-lg bg-rose-700 hover:bg-rose-800 text-white font-semibold transition-colors cursor-pointer"
+                            >
+                              Открыть «Вход по сессии»
+                            </button>
+                          </div>
+                        )}
                       </div>
                     )}
 
@@ -922,14 +981,120 @@ export function AccountView({
           </div>
         </div>
 
-        {/* Right: SideStore Anisette Settings */}
-        <div className="lg:col-span-5 bg-white dark:bg-[#131822] border border-slate-200 dark:border-slate-800 rounded-2xl p-5 sm:p-6 space-y-4">
-          <div className="flex items-center gap-2">
-            <Server className="w-4 h-4 text-[#0066FF]" />
-            <h2 className="text-base font-bold text-slate-900 dark:text-slate-50">
-              SideStore Anisette (Failover)
-            </h2>
+        {/* Right: FairPlay SAP Bridge + SideStore Anisette */}
+        <div className="lg:col-span-5 space-y-6">
+          <div className="bg-white dark:bg-[#131822] border border-slate-200 dark:border-slate-800 rounded-2xl p-5 sm:p-6 space-y-4">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <ShieldCheck className="w-4 h-4 text-[#0066FF]" />
+                <h2 className="text-base font-bold text-slate-900 dark:text-slate-50">
+                  FairPlay SAP Bridge
+                </h2>
+              </div>
+              {(envBridgeConfigured || bridgeUrl.trim().startsWith('https://')) && (
+                <span className="text-[11px] font-semibold text-emerald-700 dark:text-emerald-400">
+                  {envBridgeConfigured && !bridgeUrl.trim() ? 'Vercel Env' : 'Подключён'}
+                </span>
+              )}
+            </div>
+
+            <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
+              Для прямого входа по Apple ID + 2FA с Vercel Apple требует нативную подпись{' '}
+              <span className="font-mono">FairPlay SAP (CoreFP)</span>. Разверните Docker-контейнер из папки{' '}
+              <span className="font-mono">companion/</span> на Render / Railway / VPS и укажите его адрес ниже (или в{' '}
+              <span className="font-mono">SAP_BRIDGE_URL</span> на Vercel).
+            </p>
+
+            {envBridgeConfigured && !bridgeUrl.trim() && (
+              <div className="p-3 rounded-xl bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-900/60 text-xs text-emerald-900 dark:text-emerald-200">
+                Мост автоматически подключён через переменную окружения{' '}
+                <span className="font-mono font-semibold">SAP_BRIDGE_URL</span> на Vercel.
+              </div>
+            )}
+
+            <div className="space-y-3">
+              <div className="space-y-1.5">
+                <label
+                  htmlFor="sap-bridge-url"
+                  className="block text-xs font-medium text-slate-600 dark:text-slate-400"
+                >
+                  HTTPS-адрес моста (опционально)
+                </label>
+                <input
+                  id="sap-bridge-url"
+                  type="url"
+                  value={bridgeUrl}
+                  onChange={(e) => {
+                    setBridgeUrl(e.target.value);
+                    saveBridgeConfig(e.target.value, bridgeSecret);
+                  }}
+                  placeholder="https://ipa-sap-bridge.onrender.com"
+                  className="w-full min-h-[42px] px-3 py-2 text-xs font-mono rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-100 placeholder:text-slate-400"
+                />
+              </div>
+
+              <div className="space-y-1.5">
+                <label
+                  htmlFor="sap-bridge-secret"
+                  className="block text-xs font-medium text-slate-600 dark:text-slate-400"
+                >
+                  Ключ доступа BRIDGE_SECRET (если задан)
+                </label>
+                <input
+                  id="sap-bridge-secret"
+                  type="password"
+                  value={bridgeSecret}
+                  onChange={(e) => {
+                    setBridgeSecret(e.target.value);
+                    saveBridgeConfig(bridgeUrl, e.target.value);
+                  }}
+                  placeholder="Опционально"
+                  className="w-full min-h-[42px] px-3 py-2 text-xs font-mono rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-100 placeholder:text-slate-400"
+                />
+              </div>
+
+              <button
+                type="button"
+                disabled={isTestingBridge}
+                onClick={handleTestBridge}
+                className="w-full min-h-[42px] px-4 py-2 text-xs font-semibold rounded-xl border border-slate-200 dark:border-slate-700 text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors inline-flex items-center justify-center gap-2 cursor-pointer"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isTestingBridge ? 'animate-spin' : ''}`} />
+                <span>Проверить FairPlay SAP Bridge</span>
+              </button>
+
+              {bridgeResult && (
+                <div
+                  className={`p-3 rounded-xl border text-xs ${
+                    bridgeResult.ok
+                      ? 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-900/60 text-emerald-900 dark:text-emerald-200'
+                      : 'bg-rose-50 dark:bg-rose-950/35 border-rose-200 dark:border-rose-900/60 text-rose-800 dark:text-rose-200'
+                  }`}
+                >
+                  {bridgeResult.ok ? (
+                    <div className="space-y-0.5">
+                      <div className="font-semibold">
+                        Мост {bridgeResult.engine} готов к работе
+                      </div>
+                      <div className="font-mono tabular-nums opacity-85">
+                        Задержка: {bridgeResult.latencyMs} мс
+                      </div>
+                    </div>
+                  ) : (
+                    <span>{bridgeResult.error}</span>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
+
+          <div className="bg-white dark:bg-[#131822] border border-slate-200 dark:border-slate-800 rounded-2xl p-5 sm:p-6 space-y-4">
+            <div className="flex items-center gap-2">
+              <Server className="w-4 h-4 text-[#0066FF]" />
+              <h2 className="text-base font-bold text-slate-900 dark:text-slate-50">
+                SideStore Anisette (Failover)
+              </h2>
+            </div>
 
           <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
             Параллельно опрашивает до 4 серверов <span className="font-mono">SideStore/anisette-servers</span> одновременно и выбирает самый быстрый ответ для стабильной авторизации Apple ID.
@@ -1022,6 +1187,7 @@ export function AccountView({
               )}
             </div>
           )}
+          </div>
         </div>
       </div>
     </div>

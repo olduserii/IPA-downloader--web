@@ -5,6 +5,8 @@ import type {
   AppleSessionSummary,
   AppVersionEntry,
   AuthLoginResponse,
+  BridgeStatusResponse,
+  BridgeTestResult,
   CachedAppMetadata,
   GeneratedSessionResponse,
   ITunesSearchItem,
@@ -15,6 +17,46 @@ import type {
 const CSRF_HEADERS: Record<string, string> = {
   'X-Requested-With': 'IPAVaultWeb',
 };
+
+const BRIDGE_URL_STORAGE_KEY = 'ipavault_sap_bridge_url';
+const BRIDGE_SECRET_SESSION_KEY = 'ipavault_sap_bridge_secret';
+
+export function getSavedBridgeConfig(): { bridgeUrl: string; bridgeSecret: string } {
+  if (typeof window === 'undefined') return { bridgeUrl: '', bridgeSecret: '' };
+  return {
+    bridgeUrl: localStorage.getItem(BRIDGE_URL_STORAGE_KEY) || '',
+    bridgeSecret: sessionStorage.getItem(BRIDGE_SECRET_SESSION_KEY) || '',
+  };
+}
+
+export function saveBridgeConfig(bridgeUrl: string, bridgeSecret: string): void {
+  if (typeof window === 'undefined') return;
+  const cleanUrl = bridgeUrl.trim();
+  const cleanSecret = bridgeSecret.trim();
+  if (cleanUrl) {
+    localStorage.setItem(BRIDGE_URL_STORAGE_KEY, cleanUrl);
+  } else {
+    localStorage.removeItem(BRIDGE_URL_STORAGE_KEY);
+  }
+  if (cleanSecret) {
+    sessionStorage.setItem(BRIDGE_SECRET_SESSION_KEY, cleanSecret);
+  } else {
+    sessionStorage.removeItem(BRIDGE_SECRET_SESSION_KEY);
+  }
+}
+
+function getBridgeHeaders(override?: {
+  bridgeUrl?: string;
+  bridgeSecret?: string;
+}): Record<string, string> {
+  const saved = getSavedBridgeConfig();
+  const url = (override?.bridgeUrl ?? saved.bridgeUrl).trim();
+  const secret = (override?.bridgeSecret ?? saved.bridgeSecret).trim();
+  const headers: Record<string, string> = {};
+  if (url) headers['X-SAP-Bridge-Url'] = url;
+  if (secret) headers['X-SAP-Bridge-Secret'] = secret;
+  return headers;
+}
 
 async function parseJson<T>(res: Response): Promise<T> {
   const text = await res.text();
@@ -104,6 +146,29 @@ export async function apiTestAnisette(address?: string): Promise<AnisetteTestRes
   return parseJson<AnisetteTestResult>(res);
 }
 
+export async function apiGetBridgeStatus(): Promise<BridgeStatusResponse> {
+  const res = await fetch('/api/bridge/status', {
+    credentials: 'include',
+  });
+  return parseJson<BridgeStatusResponse>(res);
+}
+
+export async function apiTestBridge(
+  bridgeUrl?: string,
+  bridgeSecret?: string
+): Promise<BridgeTestResult> {
+  const res = await fetch('/api/bridge/test', {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json', ...CSRF_HEADERS },
+    body: JSON.stringify({
+      bridgeUrl: bridgeUrl?.trim() || undefined,
+      bridgeSecret: bridgeSecret?.trim() || undefined,
+    }),
+  });
+  return parseJson<BridgeTestResult>(res);
+}
+
 export async function apiRestoreBrowserSession(): Promise<{
   authenticated: boolean;
   token?: string;
@@ -126,14 +191,27 @@ export async function apiLoginAppleId(params: {
   guid?: string;
   authEndpoint?: string;
   persistMode: SessionPersistMode;
-}): Promise<AuthLoginResponse & { guid?: string; authEndpoint?: string }> {
+  bridgeUrl?: string;
+  bridgeSecret?: string;
+}): Promise<
+  AuthLoginResponse & { guid?: string; authEndpoint?: string; requiresSapBridge?: boolean }
+> {
   const res = await fetch('/api/auth/login', {
     method: 'POST',
     credentials: 'include',
-    headers: { 'Content-Type': 'application/json', ...CSRF_HEADERS },
+    headers: {
+      'Content-Type': 'application/json',
+      ...CSRF_HEADERS,
+      ...getBridgeHeaders({
+        bridgeUrl: params.bridgeUrl,
+        bridgeSecret: params.bridgeSecret,
+      }),
+    },
     body: JSON.stringify(params),
   });
-  return parseJson<AuthLoginResponse & { guid?: string; authEndpoint?: string }>(res);
+  return parseJson<
+    AuthLoginResponse & { guid?: string; authEndpoint?: string; requiresSapBridge?: boolean }
+  >(res);
 }
 
 export async function apiLoginWithSessionToken(params: {
@@ -202,6 +280,7 @@ export async function apiInspectApp(params: {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     ...CSRF_HEADERS,
+    ...getBridgeHeaders(),
   };
   if (params.authToken) {
     headers.Authorization = `Bearer ${params.authToken}`;
@@ -229,6 +308,7 @@ export async function apiPurchaseFreeLicense(
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     ...CSRF_HEADERS,
+    ...getBridgeHeaders(),
   };
   if (authToken) headers.Authorization = `Bearer ${authToken}`;
   const res = await fetch('/api/store/purchase', {
@@ -251,6 +331,7 @@ export async function apiCheckOwnershipBatch(
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     ...CSRF_HEADERS,
+    ...getBridgeHeaders(),
   };
   if (authToken) headers.Authorization = `Bearer ${authToken}`;
   const res = await fetch('/api/store/check-ownership', {
