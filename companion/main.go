@@ -159,6 +159,49 @@ func (c *pendingAuthCache) Delete(email string) {
 	delete(c.entries, strings.ToLower(strings.TrimSpace(email)))
 }
 
+type activeSessionCache struct {
+	mu      sync.Mutex
+	entries map[string]pendingAuthEntry
+}
+
+func newActiveSessionCache() *activeSessionCache {
+	return &activeSessionCache{entries: make(map[string]pendingAuthEntry)}
+}
+
+func (c *activeSessionCache) Get(dsid string) (appstore.AppStore, bool) {
+	key := strings.TrimSpace(dsid)
+	if key == "" {
+		return nil, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	for k, v := range c.entries {
+		if now.After(v.expiresAt) {
+			delete(c.entries, k)
+		}
+	}
+	entry, ok := c.entries[key]
+	if !ok {
+		return nil, false
+	}
+	return entry.store, true
+}
+
+func (c *activeSessionCache) Put(dsid string, store appstore.AppStore, guid string) {
+	key := strings.TrimSpace(dsid)
+	if key == "" || store == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[key] = pendingAuthEntry{
+		store:     store,
+		guid:      guid,
+		expiresAt: time.Now().Add(24 * time.Hour),
+	}
+}
+
 func newEphemeralStore() (appstore.AppStore, string, error) {
 	osSvc := operatingsystem.New()
 	mach := machine.New(machine.Args{OS: osSvc})
@@ -223,6 +266,7 @@ func main() {
 	}
 	bridgeSecret := strings.TrimSpace(os.Getenv("BRIDGE_SECRET"))
 	pending2FA := newPendingAuthCache()
+	activeSessions := newActiveSessionCache()
 
 	mux := http.NewServeMux()
 
@@ -291,6 +335,12 @@ func main() {
 
 		pending2FA.Delete(email)
 
+		// Cache authenticated cookieJar/store in RAM by DSID so inspect & purchase
+		// reuse Apple's session cookies seamlessly without re-provisioning.
+		if out.Account.DirectoryServicesID != "" {
+			activeSessions.Put(out.Account.DirectoryServicesID, store, guid)
+		}
+
 		// Never echo the raw Apple ID password back over HTTP
 		acc := out.Account
 		acc.Password = ""
@@ -316,10 +366,15 @@ func main() {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "Invalid appID"})
 			return
 		}
-		store, _, err := newEphemeralStore()
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-			return
+		store, ok := activeSessions.Get(req.Account.DirectoryServicesID)
+		if !ok {
+			var guid string
+			store, guid, err = newEphemeralStore()
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+			activeSessions.Put(req.Account.DirectoryServicesID, store, guid)
 		}
 		type inspector interface {
 			InspectDownload(context.Context, appstore.Account, int64, string) (appstore.InspectDownloadOutput, error)
@@ -363,10 +418,15 @@ func main() {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "Invalid appID"})
 			return
 		}
-		store, _, err := newEphemeralStore()
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
-			return
+		store, ok := activeSessions.Get(req.Account.DirectoryServicesID)
+		if !ok {
+			var guid string
+			store, guid, err = newEphemeralStore()
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+				return
+			}
+			activeSessions.Put(req.Account.DirectoryServicesID, store, guid)
 		}
 		err = store.Purchase(appstore.PurchaseInput{
 			Account:  req.Account,

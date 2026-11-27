@@ -97,8 +97,13 @@ export function ExtractorView({
       });
       setResult(data);
 
+      // Never auto-sign-out the user on a per-app inspect failure; let them review
+      // the warning or manually re-authenticate on the Account tab if needed.
       if (data.sessionExpired) {
-        onSessionExpired();
+        setErrorText(
+          data.warning ||
+            'Apple запросил подтверждение сессии для этого приложения. Вы можете повторить попытку или обновить вход на вкладке «Аккаунт».'
+        );
       }
 
       if (data.descriptor) {
@@ -142,8 +147,9 @@ export function ExtractorView({
     try {
       const res = await apiPurchaseFreeLicense(result.appID, authToken);
       if (res.sessionExpired) {
-        onSessionExpired();
-        setErrorText('Сессия Apple ID истекла — выполните повторный вход.');
+        setErrorText(
+          'Apple запросил повторную авторизацию для покупки лицензии — обновите вход на вкладке «Аккаунт».'
+        );
         return;
       }
       if (!res.ok) {
@@ -662,14 +668,14 @@ export function ExtractorView({
                     </p>
                   </div>
 
-                  {!session ? (
+                  {!session || result.sessionExpired ? (
                     <button
                       type="button"
                       onClick={onOpenAccount}
                       className="w-full min-h-[48px] px-4 py-2.5 text-sm font-semibold rounded-xl bg-[#0066FF] hover:bg-[#0052CC] text-white transition-colors inline-flex items-center justify-center gap-2 cursor-pointer"
                     >
                       <KeyRound className="w-4 h-4" />
-                      <span>Войти в Apple ID</span>
+                      <span>{result.sessionExpired ? 'Обновить вход в Apple ID' : 'Войти в Apple ID'}</span>
                     </button>
                   ) : (
                     result.availability !== 'deletedGlobally' && (

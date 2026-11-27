@@ -14,6 +14,7 @@ import { HistoryView } from './components/HistoryView.tsx';
 import { OtaHandoffBanner } from './components/OtaHandoffBanner.tsx';
 import { PopularListsView } from './components/PopularListsView.tsx';
 import { BUILT_IN_APPS_LIST } from './data/builtInAppsList.ts';
+import { TOP_25_APPS } from './data/top25Apps.ts';
 import {
   apiCheckOwnershipBatch,
   apiLogout,
@@ -122,8 +123,8 @@ export default function App() {
     apiRestoreBrowserSession()
       .then((res) => {
         if (active && res.authenticated && res.session) {
-          setAuthToken(res.token ?? null);
-          setSession(res.session);
+          setAuthToken((prev) => prev ?? res.token ?? null);
+          setSession((prev) => prev ?? res.session ?? null);
         }
       })
       .catch(() => {
@@ -259,8 +260,7 @@ export default function App() {
         }
 
         if (res.sessionExpired) {
-          handleSignOut();
-          showToast('Сессия Apple ID истекла — выполните повторный вход');
+          showToast('Apple запросил обновление входа для части приложений — откройте вкладку «Вход»');
           break;
         }
 
@@ -420,6 +420,7 @@ export default function App() {
 
         {activeTab === 'lists' && (
           <PopularListsView
+            top25Entries={TOP_25_APPS}
             popularEntries={popularEntries}
             customEntries={customEntries}
             customListText={customRaw}

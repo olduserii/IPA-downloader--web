@@ -11,7 +11,14 @@ import {
   X,
   XCircle,
 } from 'lucide-react';
-import { type ChangeEvent, useDeferredValue, useMemo, useRef, useState } from 'react';
+import {
+  type ChangeEvent,
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { downloadTextFile } from '../lib/api.ts';
 import { DEFAULT_CUSTOM_LIST_TEMPLATE } from '../shared/parsers.ts';
 import type {
@@ -26,6 +33,7 @@ import { AppIcon } from './AppIcon.tsx';
 type AvailabilityFilter = 'all' | 'deleted' | 'us' | 'ru' | 'ios' | 'owned';
 
 interface PopularListsViewProps {
+  top25Entries: CuratedAppEntry[];
   popularEntries: CuratedAppEntry[];
   customEntries: CuratedAppEntry[];
   customListText: string;
@@ -76,6 +84,7 @@ function renderAvailabilityLabel(status: AppAvailabilityStatus | undefined) {
 }
 
 export function PopularListsView({
+  top25Entries,
   popularEntries,
   customEntries,
   customListText,
@@ -94,7 +103,7 @@ export function PopularListsView({
   onSelectApp,
   onOpenAccount,
 }: PopularListsViewProps) {
-  const [source, setSource] = useState<CuratedListSource>('popular');
+  const [source, setSource] = useState<CuratedListSource>('top25');
   const [filter, setFilter] = useState<AvailabilityFilter>('all');
   const [iosFilter, setIosFilter] = useState<number>(17);
   const [query, setQuery] = useState('');
@@ -103,8 +112,30 @@ export function PopularListsView({
   const [showCustomEditor, setShowCustomEditor] = useState(false);
   const [draftCustomText, setDraftCustomText] = useState(customListText);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const didAutoLookupTop25 = useRef(false);
 
-  const activeEntries = source === 'popular' ? popularEntries : customEntries;
+  const activeEntries =
+    source === 'top25'
+      ? top25Entries
+      : source === 'popular'
+      ? popularEntries
+      : customEntries;
+
+  // Automatically fetch icons & RU/US App Store availability for the 25 top apps once
+  useEffect(() => {
+    if (source !== 'top25' || didAutoLookupTop25.current || availabilityProgress.active) {
+      return;
+    }
+    const missing = top25Entries
+      .map((e) => e.id)
+      .filter((id) => !metadataCache[id]);
+    if (missing.length > 0) {
+      didAutoLookupTop25.current = true;
+      onCheckAvailability(missing);
+    } else {
+      didAutoLookupTop25.current = true;
+    }
+  }, [source, top25Entries, metadataCache, availabilityProgress.active, onCheckAvailability]);
 
   const availableIosVersions = useMemo(() => {
     const set = new Set<number>();
@@ -198,7 +229,22 @@ export function PopularListsView({
         </div>
 
         {/* Source Segmented Control */}
-        <div className="inline-flex items-center p-1 bg-slate-200/70 dark:bg-slate-800/80 rounded-xl self-start lg:self-auto">
+        <div className="inline-flex items-center p-1 bg-slate-200/70 dark:bg-slate-800/80 rounded-xl self-start lg:self-auto max-w-full overflow-x-auto">
+          <button
+            type="button"
+            onClick={() => {
+              setSource('top25');
+              setVisibleCount(PAGE_SIZE);
+              setShowCustomEditor(false);
+            }}
+            className={`min-h-[40px] px-3.5 sm:px-4 py-2 text-xs sm:text-sm font-medium rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+              source === 'top25'
+                ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-xs'
+                : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100'
+            }`}
+          >
+            Топ 25
+          </button>
           <button
             type="button"
             onClick={() => {
@@ -206,13 +252,13 @@ export function PopularListsView({
               setVisibleCount(PAGE_SIZE);
               setShowCustomEditor(false);
             }}
-            className={`min-h-[40px] px-4 py-2 text-sm font-medium rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+            className={`min-h-[40px] px-3.5 sm:px-4 py-2 text-xs sm:text-sm font-medium rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
               source === 'popular'
                 ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-xs'
                 : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100'
             }`}
           >
-            Популярные ({popularEntries.length})
+            Все .txt ({popularEntries.length})
           </button>
           <button
             type="button"
@@ -220,7 +266,7 @@ export function PopularListsView({
               setSource('custom');
               setVisibleCount(PAGE_SIZE);
             }}
-            className={`min-h-[40px] px-4 py-2 text-sm font-medium rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+            className={`min-h-[40px] px-3.5 sm:px-4 py-2 text-xs sm:text-sm font-medium rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
               source === 'custom'
                 ? 'bg-white dark:bg-slate-900 text-slate-900 dark:text-white shadow-xs'
                 : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100'
@@ -280,7 +326,7 @@ export function PopularListsView({
               </button>
             )}
 
-            {source === 'popular' ? (
+            {source !== 'custom' ? (
               <button
                 type="button"
                 disabled={isSyncingGitHub}
@@ -484,10 +530,11 @@ export function PopularListsView({
           </div>
         ) : (
           <ul className="divide-y divide-slate-100 dark:divide-slate-800/80">
-            {displayedEntries.map((entry) => {
+            {displayedEntries.map((entry, idx) => {
               const meta = metadataCache[entry.id];
               const own = ownershipCache[entry.id];
               const mappedExtVer = filter === 'ios' ? entry.iosVersionMap[iosFilter] : undefined;
+              const rankNumber = source === 'top25' ? idx + 1 : null;
 
               return (
                 <li key={entry.id}>
@@ -496,6 +543,11 @@ export function PopularListsView({
                     onClick={() => onSelectApp(entry, mappedExtVer)}
                     className="w-full min-h-[68px] px-4 sm:px-5 py-3.5 flex items-center gap-3.5 text-left hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors cursor-pointer group"
                   >
+                    {rankNumber !== null && (
+                      <span className="w-6 text-right font-mono text-xs font-semibold text-slate-400 dark:text-slate-500 tabular-nums shrink-0">
+                        {rankNumber}
+                      </span>
+                    )}
                     <AppIcon
                       src={meta?.iconURL}
                       name={entry.name}

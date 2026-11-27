@@ -109,7 +109,9 @@ function resolveSessionFromRequest(req: Request): ResolvedAuth {
 
   const cookieToken = cookies[SESSION_COOKIE_NAME];
   if (cookieToken) {
-    const fromCookie = decryptSessionToken(cookieToken, browserKeyHex);
+    const fromCookie =
+      (browserKeyHex ? decryptSessionToken(cookieToken, browserKeyHex) : null) ??
+      decryptSessionToken(cookieToken);
     if (fromCookie) {
       return { session: fromCookie, usedCookie: true, browserKeyHex, hadExpiredCredential: false };
     }
@@ -298,7 +300,8 @@ export function createApiRouter(): express.Router {
         const { bearerToken } = setBrowserSessionCookies(
           res,
           result.rawSession,
-          cookies[SESSION_KEY_COOKIE_NAME]
+          cookies[SESSION_KEY_COOKIE_NAME],
+          req
         );
         res.json({
           status: 'authenticated',
@@ -330,7 +333,7 @@ export function createApiRouter(): express.Router {
     const resolved = resolveSessionFromRequest(req);
     if (!resolved.session) {
       if (resolved.hadExpiredCredential && resolved.usedCookie) {
-        clearBrowserSessionCookies(res);
+        clearBrowserSessionCookies(res, req);
       }
       res.json({ authenticated: false, expired: resolved.hadExpiredCredential });
       return;
@@ -339,7 +342,8 @@ export function createApiRouter(): express.Router {
     const { bearerToken } = setBrowserSessionCookies(
       res,
       resolved.session,
-      resolved.browserKeyHex
+      resolved.browserKeyHex,
+      req
     );
 
     res.json({
@@ -373,7 +377,7 @@ export function createApiRouter(): express.Router {
       expiresAt: Date.now() + ttlMs,
     };
 
-    const { bearerToken } = setBrowserSessionCookies(res, updated, resolved.browserKeyHex);
+    const { bearerToken } = setBrowserSessionCookies(res, updated, resolved.browserKeyHex, req);
     res.json({
       ok: true,
       token: bearerToken,
@@ -444,7 +448,8 @@ export function createApiRouter(): express.Router {
     const { bearerToken } = setBrowserSessionCookies(
       res,
       restoredSession,
-      cookies[SESSION_KEY_COOKIE_NAME]
+      cookies[SESSION_KEY_COOKIE_NAME],
+      req
     );
 
     res.json({
@@ -460,7 +465,7 @@ export function createApiRouter(): express.Router {
       res.status(403).json({ ok: false, error: 'Запрос отклонён проверкой источника' });
       return;
     }
-    clearBrowserSessionCookies(res);
+    clearBrowserSessionCookies(res, req);
     res.json({ ok: true });
   });
 

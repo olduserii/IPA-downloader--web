@@ -6,7 +6,7 @@ export type AppAvailabilityStatus =
 
 export type AccountOwnershipStatus = 'unknown' | 'owned' | 'notOwned' | 'error';
 
-export type CuratedListSource = 'popular' | 'custom';
+export type CuratedListSource = 'top25' | 'popular' | 'custom';
 
 export interface CuratedAppEntry {
   id: string;

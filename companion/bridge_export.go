@@ -34,9 +34,7 @@ func (t *appstore) InspectDownload(
 	if err != nil {
 		return InspectDownloadOutput{}, err
 	}
-	if res.Data.FailureType == FailureTypePasswordTokenExpired ||
-		res.Data.FailureType == FailureTypeSignInRequired ||
-		res.Data.FailureType == FailureTypeDeviceVerificationFailed {
+	if res.Data.FailureType == FailureTypePasswordTokenExpired {
 		return InspectDownloadOutput{}, ErrPasswordTokenExpired
 	}
 	if res.Data.FailureType == FailureTypeLicenseNotFound {

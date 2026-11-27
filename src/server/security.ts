@@ -20,6 +20,20 @@ function getServerMasterKey(): Buffer | null {
   return null;
 }
 
+function getDeploymentStableKey(): Buffer {
+  const master = getServerMasterKey();
+  if (master) return master;
+  const autoSeed =
+    process.env.VERCEL_PROJECT_ID?.trim() ||
+    process.env.VERCEL_URL?.trim() ||
+    process.env.APP_URL?.trim() ||
+    '';
+  if (autoSeed) {
+    return crypto.createHash('sha256').update(`ipavault-deploy:${autoSeed}`).digest();
+  }
+  return EPHEMERAL_FALLBACK;
+}
+
 // Manifest links are fetched by iOS itunesstored without browser cookies,
 // so derive a deployment-stable HMAC key automatically on Vercel (VERCEL_PROJECT_ID)
 // when SESSION_SECRET is not manually set.
@@ -45,7 +59,7 @@ function deriveEffectiveSessionKey(browserKeyHex?: string): Buffer {
     }
     return rawBrowserKey;
   }
-  return master ?? EPHEMERAL_FALLBACK;
+  return getDeploymentStableKey();
 }
 
 export interface StoredAppleSession {
@@ -275,43 +289,92 @@ export function parseCookies(cookieHeader?: string): Record<string, string> {
   return map;
 }
 
-function buildCookieString(name: string, value: string, maxAgeSec: number): string {
+function isCrossSiteIframeRequest(req?: Request): boolean {
+  if (!req) return false;
+  const fetchSite = String(req.headers['sec-fetch-site'] || '').toLowerCase();
+  const fetchDest = String(req.headers['sec-fetch-dest'] || '').toLowerCase();
+  return fetchSite === 'cross-site' || fetchDest === 'iframe';
+}
+
+function isSecureRequest(req?: Request): boolean {
+  if (!req) return true;
+  const proto = String(req.headers['x-forwarded-proto'] || '').toLowerCase();
+  if (proto.includes('https')) return true;
+  if (req.secure) return true;
+  const host = String(req.headers.host || '').toLowerCase();
+  if (host.startsWith('localhost:') || host.startsWith('127.0.0.1:')) return false;
+  return true;
+}
+
+function buildCookieString(
+  name: string,
+  value: string,
+  maxAgeSec: number,
+  req?: Request
+): string {
   const encoded = encodeURIComponent(value);
-  return `${name}=${encoded}; Path=/; Max-Age=${maxAgeSec}; HttpOnly; Secure; SameSite=None; Partitioned`;
+  const expires = new Date(Date.now() + maxAgeSec * 1000).toUTCString();
+  const secure = isSecureRequest(req);
+  const crossSite = isCrossSiteIframeRequest(req);
+
+  const attrs = [
+    `${name}=${encoded}`,
+    'Path=/',
+    `Max-Age=${maxAgeSec}`,
+    `Expires=${expires}`,
+    'HttpOnly',
+  ];
+
+  if (crossSite && secure) {
+    attrs.push('Secure', 'SameSite=None', 'Partitioned');
+  } else if (secure) {
+    // First-party top-level site (e.g. ipaweb.vercel.app on iPhone Safari):
+    // SameSite=Lax avoids iOS Safari ITP & Partitioned cookie drops across reloads.
+    attrs.push('Secure', 'SameSite=Lax');
+  } else {
+    attrs.push('SameSite=Lax');
+  }
+
+  return attrs.join('; ');
 }
 
 export function setBrowserSessionCookies(
   res: Response,
   session: StoredAppleSession,
-  existingBrowserKeyHex?: string
+  existingBrowserKeyHex?: string,
+  req?: Request
 ): { bearerToken: string; browserKeyHex: string } {
   const browserKeyHex =
     existingBrowserKeyHex && /^[0-9a-f]{64}$/i.test(existingBrowserKeyHex)
       ? existingBrowserKeyHex
       : crypto.randomBytes(32).toString('hex');
 
-  const token = encryptSessionToken(session, browserKeyHex);
+  // Encrypt the cookie payload with per-browser key, and encrypt the returned Bearer
+  // token with the deployment-stable key so in-memory Bearer requests never fail
+  // even if a browser blocks cookies or Vercel cold-starts a new serverless worker.
+  const cookieToken = encryptSessionToken(session, browserKeyHex);
+  const bearerToken = encryptSessionToken(session);
 
   if (session.persistMode === 'memory') {
-    clearBrowserSessionCookies(res);
-    return { bearerToken: token, browserKeyHex };
+    clearBrowserSessionCookies(res, req);
+    return { bearerToken, browserKeyHex };
   }
 
   const maxAgeSec =
     session.persistMode === 'keep' ? SESSION_TTL_KEEP_SEC : SESSION_TTL_24H_SEC;
 
   res.setHeader('Set-Cookie', [
-    buildCookieString(SESSION_COOKIE_NAME, token, maxAgeSec),
-    buildCookieString(SESSION_KEY_COOKIE_NAME, browserKeyHex, maxAgeSec),
+    buildCookieString(SESSION_COOKIE_NAME, cookieToken, maxAgeSec, req),
+    buildCookieString(SESSION_KEY_COOKIE_NAME, browserKeyHex, maxAgeSec, req),
   ]);
 
-  return { bearerToken: token, browserKeyHex };
+  return { bearerToken, browserKeyHex };
 }
 
-export function clearBrowserSessionCookies(res: Response): void {
+export function clearBrowserSessionCookies(res: Response, req?: Request): void {
   res.setHeader('Set-Cookie', [
-    buildCookieString(SESSION_COOKIE_NAME, '', 0),
-    buildCookieString(SESSION_KEY_COOKIE_NAME, '', 0),
+    buildCookieString(SESSION_COOKIE_NAME, '', 0, req),
+    buildCookieString(SESSION_KEY_COOKIE_NAME, '', 0, req),
   ]);
 }
 
