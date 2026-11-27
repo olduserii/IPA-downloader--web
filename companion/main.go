@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/cookiejar"
@@ -19,6 +21,8 @@ import (
 	"github.com/majd/ipatool/v2/pkg/util/operatingsystem"
 )
 
+const anisetteKeyName = "anisette-v4"
+
 // memoryCookieJar wraps net/http/cookiejar to satisfy ipatool's pkg/http.CookieJar interface.
 type memoryCookieJar struct {
 	*cookiejar.Jar
@@ -28,9 +32,37 @@ func (m *memoryCookieJar) Save() error {
 	return nil
 }
 
+// fixedMachine overrides MacAddress when restoring a session with a saved GUID so
+// StoreAMDHeaders & kbsync use the exact same 6-byte hardwareID across container restarts.
+type fixedMachine struct {
+	machine.Machine
+	mac string
+}
+
+func (f *fixedMachine) MacAddress() (string, error) {
+	if f.mac != "" {
+		return f.mac, nil
+	}
+	return f.Machine.MacAddress()
+}
+
+func formatGuidAsMac(guid string) string {
+	clean := strings.ToUpper(strings.TrimSpace(guid))
+	if len(clean) != 12 {
+		return ""
+	}
+	for _, c := range clean {
+		if !((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F')) {
+			return ""
+		}
+	}
+	return fmt.Sprintf("%s:%s:%s:%s:%s:%s",
+		clean[0:2], clean[2:4], clean[4:6], clean[6:8], clean[8:10], clean[10:12])
+}
+
 // memoryKeychain keeps credentials strictly in RAM and never writes passwords to disk.
-// Machine-level anisette provisioning state ("anisette-v4") is optionally shared in RAM
-// across logins so subsequent requests skip slow re-provisioning.
+// Each store can hold its own provisioned anisette-v4 state (restored from token across restarts),
+// while also falling back to shared RAM state for fast same-container reuse.
 type memoryKeychain struct {
 	mu           sync.RWMutex
 	data         map[string][]byte
@@ -68,40 +100,45 @@ func (s *sharedAnisetteStore) Set(key string, val []byte) {
 
 var globalAnisette = newSharedAnisetteStore()
 
-func newMemoryKeychain() *memoryKeychain {
-	return &memoryKeychain{
+func newMemoryKeychain(initialAnisette []byte) *memoryKeychain {
+	kc := &memoryKeychain{
 		data:         make(map[string][]byte),
 		sharedDevice: globalAnisette,
 	}
+	if len(initialAnisette) > 0 {
+		cp := make([]byte, len(initialAnisette))
+		copy(cp, initialAnisette)
+		kc.data[anisetteKeyName] = cp
+	}
+	return kc
 }
 
 func (m *memoryKeychain) Get(key string) ([]byte, error) {
-	if key == "anisette-v4" && m.sharedDevice != nil {
-		if val, ok := m.sharedDevice.Get(key); ok {
-			return val, nil
+	m.mu.RLock()
+	val, ok := m.data[key]
+	m.mu.RUnlock()
+	if ok {
+		cp := make([]byte, len(val))
+		copy(cp, val)
+		return cp, nil
+	}
+	if key == anisetteKeyName && m.sharedDevice != nil {
+		if sharedVal, sharedOk := m.sharedDevice.Get(key); sharedOk {
+			return sharedVal, nil
 		}
 	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	val, ok := m.data[key]
-	if !ok {
-		return nil, os.ErrNotExist
-	}
-	cp := make([]byte, len(val))
-	copy(cp, val)
-	return cp, nil
+	return nil, os.ErrNotExist
 }
 
 func (m *memoryKeychain) Set(key string, val []byte) error {
-	if key == "anisette-v4" && m.sharedDevice != nil {
-		m.sharedDevice.Set(key, val)
-		return nil
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	cp := make([]byte, len(val))
 	copy(cp, val)
+	m.mu.Lock()
 	m.data[key] = cp
+	m.mu.Unlock()
+	if key == anisetteKeyName && m.sharedDevice != nil {
+		m.sharedDevice.Set(key, cp)
+	}
 	return nil
 }
 
@@ -114,6 +151,7 @@ func (m *memoryKeychain) Remove(key string) error {
 
 type pendingAuthEntry struct {
 	store     appstore.AppStore
+	keychain  *memoryKeychain
 	guid      string
 	account   *appstore.Account
 	expiresAt time.Time
@@ -128,7 +166,7 @@ func newPendingAuthCache() *pendingAuthCache {
 	return &pendingAuthCache{entries: make(map[string]pendingAuthEntry)}
 }
 
-func (c *pendingAuthCache) Get(email string) (appstore.AppStore, string, bool) {
+func (c *pendingAuthCache) Get(email string) (appstore.AppStore, *memoryKeychain, string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	now := time.Now()
@@ -139,16 +177,17 @@ func (c *pendingAuthCache) Get(email string) (appstore.AppStore, string, bool) {
 	}
 	entry, ok := c.entries[strings.ToLower(strings.TrimSpace(email))]
 	if !ok {
-		return nil, "", false
+		return nil, nil, "", false
 	}
-	return entry.store, entry.guid, true
+	return entry.store, entry.keychain, entry.guid, true
 }
 
-func (c *pendingAuthCache) Put(email string, store appstore.AppStore, guid string) {
+func (c *pendingAuthCache) Put(email string, store appstore.AppStore, kc *memoryKeychain, guid string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.entries[strings.ToLower(strings.TrimSpace(email))] = pendingAuthEntry{
 		store:     store,
+		keychain:  kc,
 		guid:      guid,
 		expiresAt: time.Now().Add(5 * time.Minute),
 	}
@@ -169,10 +208,10 @@ func newActiveSessionCache() *activeSessionCache {
 	return &activeSessionCache{entries: make(map[string]pendingAuthEntry)}
 }
 
-func (c *activeSessionCache) Get(dsid string) (appstore.AppStore, *appstore.Account, bool) {
+func (c *activeSessionCache) Get(dsid string) (appstore.AppStore, *memoryKeychain, *appstore.Account, bool) {
 	key := strings.TrimSpace(dsid)
 	if key == "" {
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -184,12 +223,12 @@ func (c *activeSessionCache) Get(dsid string) (appstore.AppStore, *appstore.Acco
 	}
 	entry, ok := c.entries[key]
 	if !ok {
-		return nil, nil, false
+		return nil, nil, nil, false
 	}
-	return entry.store, entry.account, true
+	return entry.store, entry.keychain, entry.account, true
 }
 
-func (c *activeSessionCache) Put(dsid string, store appstore.AppStore, guid string, acc *appstore.Account) {
+func (c *activeSessionCache) Put(dsid string, store appstore.AppStore, kc *memoryKeychain, guid string, acc *appstore.Account) {
 	key := strings.TrimSpace(dsid)
 	if key == "" || store == nil {
 		return
@@ -204,29 +243,46 @@ func (c *activeSessionCache) Put(dsid string, store appstore.AppStore, guid stri
 	}
 	c.entries[key] = pendingAuthEntry{
 		store:     store,
+		keychain:  kc,
 		guid:      guid,
 		account:   accCopy,
 		expiresAt: time.Now().Add(24 * time.Hour),
 	}
 }
 
-func newEphemeralStore() (appstore.AppStore, string, error) {
+func newEphemeralStore(preferredGuid string, initialAnisette []byte) (appstore.AppStore, *memoryKeychain, string, error) {
 	osSvc := operatingsystem.New()
-	mach := machine.New(machine.Args{OS: osSvc})
+	var mach machine.Machine = machine.New(machine.Args{OS: osSvc})
+	if formattedMac := formatGuidAsMac(preferredGuid); formattedMac != "" {
+		mach = &fixedMachine{Machine: mach, mac: formattedMac}
+	}
 	rawJar, err := cookiejar.New(nil)
 	if err != nil {
-		return nil, "", err
+		return nil, nil, "", err
 	}
 	jar := &memoryCookieJar{Jar: rawJar}
+	kc := newMemoryKeychain(initialAnisette)
 	store := appstore.NewAppStore(appstore.Args{
 		CookieJar:       jar,
 		OperatingSystem: osSvc,
-		Keychain:        newMemoryKeychain(),
+		Keychain:        kc,
 		Machine:         mach,
 	})
 	macAddr, _ := mach.MacAddress()
 	guid := strings.ReplaceAll(strings.ToUpper(macAddr), ":", "")
-	return store, guid, nil
+	return store, kc, guid, nil
+}
+
+func decodeAnisetteState(encoded string) []byte {
+	trimmed := strings.TrimSpace(encoded)
+	if trimmed == "" || len(trimmed) > 32768 {
+		return nil
+	}
+	raw, err := base64.StdEncoding.DecodeString(trimmed)
+	if err != nil || len(raw) == 0 {
+		return nil
+	}
+	return raw
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {
@@ -260,11 +316,15 @@ type inspectReq struct {
 	Account           appstore.Account `json:"account"`
 	AppID             string           `json:"appID"`
 	ExternalVersionID string           `json:"externalVersionID"`
+	GUID              string           `json:"guid,omitempty"`
+	AnisetteState     string           `json:"anisetteState,omitempty"`
 }
 
 type purchaseReq struct {
-	Account appstore.Account `json:"account"`
-	AppID   string           `json:"appID"`
+	Account       appstore.Account `json:"account"`
+	AppID         string           `json:"appID"`
+	GUID          string           `json:"guid,omitempty"`
+	AnisetteState string           `json:"anisetteState,omitempty"`
 }
 
 func main() {
@@ -302,17 +362,19 @@ func main() {
 
 		var (
 			store appstore.AppStore
+			kc    *memoryKeychain
 			guid  string
 			err   error
 		)
 		if code != "" {
-			if cachedStore, cachedGuid, ok := pending2FA.Get(email); ok {
+			if cachedStore, cachedKc, cachedGuid, ok := pending2FA.Get(email); ok {
 				store = cachedStore
+				kc = cachedKc
 				guid = cachedGuid
 			}
 		}
 		if store == nil {
-			store, guid, err = newEphemeralStore()
+			store, kc, guid, err = newEphemeralStore("", nil)
 			if err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]any{"status": "error", "message": err.Error()})
 				return
@@ -326,7 +388,7 @@ func main() {
 		})
 		if err != nil {
 			if errors.Is(err, appstore.ErrAuthCodeRequired) {
-				pending2FA.Put(email, store, guid)
+				pending2FA.Put(email, store, kc, guid)
 				writeJSON(w, http.StatusOK, map[string]any{
 					"status":  "requires2fa",
 					"guid":    guid,
@@ -347,16 +409,24 @@ func main() {
 		acc := out.Account
 		acc.Password = ""
 
-		// Cache authenticated cookieJar/store and exact Apple-returned Account in RAM by DSID
-		// so inspect & purchase reuse Apple's session cookies, real Pod, and real StoreFront.
+		// Export provisioned Store AMD / Anisette state so the client's encrypted token
+		// works seamlessly even after Railway restarts or container migrations.
+		anisetteB64 := ""
+		if kc != nil {
+			if rawState, getErr := kc.Get(anisetteKeyName); getErr == nil && len(rawState) > 0 {
+				anisetteB64 = base64.StdEncoding.EncodeToString(rawState)
+			}
+		}
+
 		if acc.DirectoryServicesID != "" {
-			activeSessions.Put(acc.DirectoryServicesID, store, guid, &acc)
+			activeSessions.Put(acc.DirectoryServicesID, store, kc, guid, &acc)
 		}
 
 		writeJSON(w, http.StatusOK, map[string]any{
-			"status":  "authenticated",
-			"account": acc,
-			"guid":    guid,
+			"status":        "authenticated",
+			"account":       acc,
+			"guid":          guid,
+			"anisetteState": anisetteB64,
 		})
 	})
 
@@ -366,7 +436,7 @@ func main() {
 			return
 		}
 		var req inspectReq
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128<<10)).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "Invalid JSON body"})
 			return
 		}
@@ -375,24 +445,31 @@ func main() {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "Invalid appID"})
 			return
 		}
-		store, cachedAcc, ok := activeSessions.Get(req.Account.DirectoryServicesID)
+
+		providedAnisette := decodeAnisetteState(req.AnisetteState)
+		store, kc, cachedAcc, ok := activeSessions.Get(req.Account.DirectoryServicesID)
 		if !ok {
 			var guid string
-			store, guid, err = newEphemeralStore()
+			store, kc, guid, err = newEphemeralStore(req.GUID, providedAnisette)
 			if err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 				return
 			}
-			activeSessions.Put(req.Account.DirectoryServicesID, store, guid, nil)
+			activeSessions.Put(req.Account.DirectoryServicesID, store, kc, guid, nil)
+		} else if len(providedAnisette) > 0 && kc != nil {
+			if _, getErr := kc.Get(anisetteKeyName); getErr != nil {
+				_ = kc.Set(anisetteKeyName, providedAnisette)
+			}
 		}
+
 		accountToUse := req.Account
 		if cachedAcc != nil && cachedAcc.PasswordToken == req.Account.PasswordToken {
-			// Preserve exact Pod and StoreFront returned by Apple on login
 			accountToUse.Pod = cachedAcc.Pod
 			if cachedAcc.StoreFront != "" {
 				accountToUse.StoreFront = cachedAcc.StoreFront
 			}
 		}
+
 		type inspector interface {
 			InspectDownload(context.Context, appstore.Account, int64, string) (appstore.InspectDownloadOutput, error)
 		}
@@ -407,14 +484,19 @@ func main() {
 		if err != nil {
 			code := "unavailable"
 			status := http.StatusBadRequest
+			msg := err.Error()
 			if errors.Is(err, appstore.ErrPasswordTokenExpired) {
 				code = "sessionExpired"
 				status = http.StatusUnauthorized
+			} else if strings.Contains(msg, "store AMD state is not provisioned") {
+				code = "sessionExpired"
+				status = http.StatusUnauthorized
+				msg = "Сервер перезапустился, а в старом токене нет ключа устройства AMD. Выполните один новый вход по Apple ID и паролю — новый токен сохранит ключ устройства и больше не сбросится."
 			} else if errors.Is(err, appstore.ErrLicenseRequired) {
 				code = "licenseRequired"
 				status = http.StatusForbidden
 			}
-			writeJSON(w, status, map[string]any{"code": code, "error": err.Error()})
+			writeJSON(w, status, map[string]any{"code": code, "error": msg})
 			return
 		}
 		writeJSON(w, http.StatusOK, out)
@@ -426,7 +508,7 @@ func main() {
 			return
 		}
 		var req purchaseReq
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128<<10)).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "Invalid JSON body"})
 			return
 		}
@@ -435,16 +517,23 @@ func main() {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "Invalid appID"})
 			return
 		}
-		store, cachedAcc, ok := activeSessions.Get(req.Account.DirectoryServicesID)
+
+		providedAnisette := decodeAnisetteState(req.AnisetteState)
+		store, kc, cachedAcc, ok := activeSessions.Get(req.Account.DirectoryServicesID)
 		if !ok {
 			var guid string
-			store, guid, err = newEphemeralStore()
+			store, kc, guid, err = newEphemeralStore(req.GUID, providedAnisette)
 			if err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
 				return
 			}
-			activeSessions.Put(req.Account.DirectoryServicesID, store, guid, nil)
+			activeSessions.Put(req.Account.DirectoryServicesID, store, kc, guid, nil)
+		} else if len(providedAnisette) > 0 && kc != nil {
+			if _, getErr := kc.Get(anisetteKeyName); getErr != nil {
+				_ = kc.Set(anisetteKeyName, providedAnisette)
+			}
 		}
+
 		accountToUse := req.Account
 		if cachedAcc != nil && cachedAcc.PasswordToken == req.Account.PasswordToken {
 			accountToUse.Pod = cachedAcc.Pod
@@ -452,6 +541,7 @@ func main() {
 				accountToUse.StoreFront = cachedAcc.StoreFront
 			}
 		}
+
 		err = store.Purchase(appstore.PurchaseInput{
 			Account:  accountToUse,
 			App:      appstore.App{ID: appID},
@@ -460,11 +550,16 @@ func main() {
 		if err != nil && !errors.Is(err, appstore.ErrLicenseAlreadyExists) {
 			code := "unavailable"
 			status := http.StatusBadRequest
+			msg := err.Error()
 			if errors.Is(err, appstore.ErrPasswordTokenExpired) {
 				code = "sessionExpired"
 				status = http.StatusUnauthorized
+			} else if strings.Contains(msg, "store AMD state is not provisioned") {
+				code = "sessionExpired"
+				status = http.StatusUnauthorized
+				msg = "Сервер перезапустился, а в старом токене нет ключа устройства AMD. Выполните один новый вход по Apple ID и паролю — новый токен сохранит ключ устройства и больше не сбросится."
 			}
-			writeJSON(w, status, map[string]any{"ok": false, "code": code, "error": err.Error()})
+			writeJSON(w, status, map[string]any{"ok": false, "code": code, "error": msg})
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{

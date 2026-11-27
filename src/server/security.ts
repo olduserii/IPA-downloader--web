@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import net from 'node:net';
+import zlib from 'node:zlib';
 import type { Request, Response } from 'express';
 import type { SessionPersistMode } from '../shared/types.ts';
 
@@ -7,6 +8,8 @@ import type { SessionPersistMode } from '../shared/types.ts';
 const EPHEMERAL_FALLBACK = crypto.randomBytes(32);
 
 export const SESSION_COOKIE_NAME = 'ipavault_session';
+export const SESSION_COOKIE_PART2_NAME = 'ipavault_session_2';
+export const SESSION_COOKIE_PART3_NAME = 'ipavault_session_3';
 export const SESSION_KEY_COOKIE_NAME = 'ipavault_sk';
 
 export const SESSION_TTL_SEC = 365 * 24 * 60 * 60; // Persistent until explicit sign-out or Apple token expiry
@@ -74,6 +77,7 @@ export interface StoredAppleSession {
   pod: string;
   storeFront: string;
   guid: string;
+  anisetteState?: string;
   expiresAt: number;
   persistMode: SessionPersistMode;
 }
@@ -84,7 +88,12 @@ export function encryptSessionWithKey(
 ): string {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv('aes-256-gcm', keyBuf, iv);
-  const plaintext = Buffer.from(JSON.stringify(session), 'utf8');
+  const jsonBuf = Buffer.from(JSON.stringify(session), 'utf8');
+  // Compress payload with deflateRaw (0x01 header) so tokens carrying Store AMD anisetteState stay compact
+  const compressed = zlib.deflateRawSync(jsonBuf);
+  const plaintext = compressed.length + 1 < jsonBuf.length
+    ? Buffer.concat([Buffer.from([0x01]), compressed])
+    : jsonBuf;
   const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   const tag = cipher.getAuthTag();
   return Buffer.concat([iv, tag, encrypted]).toString('base64url');
@@ -96,14 +105,18 @@ export function decryptSessionWithKey(
 ): StoredAppleSession | null {
   try {
     const raw = Buffer.from(token, 'base64url');
-    if (raw.length < 29 || raw.length > 8192) return null;
+    if (raw.length < 29 || raw.length > 65536) return null;
     const iv = raw.subarray(0, 12);
     const tag = raw.subarray(12, 28);
     const ciphertext = raw.subarray(28);
     const decipher = crypto.createDecipheriv('aes-256-gcm', keyBuf, iv);
     decipher.setAuthTag(tag);
-    const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
-    const parsed = JSON.parse(decrypted) as StoredAppleSession;
+    const decryptedBuf = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    const jsonText =
+      decryptedBuf.length > 1 && decryptedBuf[0] === 0x01
+        ? zlib.inflateRawSync(decryptedBuf.subarray(1)).toString('utf8')
+        : decryptedBuf.toString('utf8');
+    const parsed = JSON.parse(jsonText) as StoredAppleSession;
     if (!parsed || typeof parsed.dsid !== 'string' || typeof parsed.passwordToken !== 'string') {
       return null;
     }
@@ -111,7 +124,7 @@ export function decryptSessionWithKey(
       return null;
     }
     if (!parsed.persistMode) {
-      parsed.persistMode = '24h';
+      parsed.persistMode = 'keep';
     }
     return parsed;
   } catch {
@@ -168,7 +181,7 @@ export function parsePortableSessionToken(
   pin?: string
 ): { session: StoredAppleSession | null; needsPin?: boolean; error?: string } {
   const trimmed = rawInput.trim();
-  if (!trimmed || trimmed.length > 10000) {
+  if (!trimmed || trimmed.length > 65536) {
     return { session: null, error: 'Некорректный формат токена сессии.' };
   }
 
@@ -338,6 +351,16 @@ function buildCookieString(
   return attrs.join('; ');
 }
 
+const MAX_COOKIE_CHUNK = 3400;
+
+export function readSessionCookieToken(cookies: Record<string, string>): string | null {
+  const p1 = cookies[SESSION_COOKIE_NAME];
+  if (!p1) return null;
+  const p2 = cookies[SESSION_COOKIE_PART2_NAME] || '';
+  const p3 = cookies[SESSION_COOKIE_PART3_NAME] || '';
+  return `${p1}${p2}${p3}`;
+}
+
 export function setBrowserSessionCookies(
   res: Response,
   session: StoredAppleSession,
@@ -360,9 +383,28 @@ export function setBrowserSessionCookies(
   // deterministically without needing SESSION_SECRET or warm Lambda state.
   const { sessionString: portableToken } = createPortableSessionToken(normalizedSession);
 
-  res.setHeader('Set-Cookie', [
-    buildCookieString(SESSION_COOKIE_NAME, portableToken, SESSION_TTL_SEC, req),
-  ]);
+  // Split safely across up to 3 cookies (<=3400 bytes each) so Safari/Chrome 4KB cookie limit
+  // never silently truncates or drops sessions carrying Store AMD anisetteState.
+  const cookieSource =
+    portableToken.length <= MAX_COOKIE_CHUNK * 3
+      ? portableToken
+      : createPortableSessionToken({ ...normalizedSession, anisetteState: undefined }).sessionString;
+
+  const c1 = cookieSource.slice(0, MAX_COOKIE_CHUNK);
+  const c2 = cookieSource.slice(MAX_COOKIE_CHUNK, MAX_COOKIE_CHUNK * 2);
+  const c3 = cookieSource.slice(MAX_COOKIE_CHUNK * 2, MAX_COOKIE_CHUNK * 3);
+
+  const setCookies = [
+    buildCookieString(SESSION_COOKIE_NAME, c1, SESSION_TTL_SEC, req),
+    c2
+      ? buildCookieString(SESSION_COOKIE_PART2_NAME, c2, SESSION_TTL_SEC, req)
+      : buildCookieString(SESSION_COOKIE_PART2_NAME, '', 0, req),
+    c3
+      ? buildCookieString(SESSION_COOKIE_PART3_NAME, c3, SESSION_TTL_SEC, req)
+      : buildCookieString(SESSION_COOKIE_PART3_NAME, '', 0, req),
+  ];
+
+  res.setHeader('Set-Cookie', setCookies);
 
   return { bearerToken: portableToken, portableToken, browserKeyHex };
 }
@@ -370,6 +412,8 @@ export function setBrowserSessionCookies(
 export function clearBrowserSessionCookies(res: Response, req?: Request): void {
   res.setHeader('Set-Cookie', [
     buildCookieString(SESSION_COOKIE_NAME, '', 0, req),
+    buildCookieString(SESSION_COOKIE_PART2_NAME, '', 0, req),
+    buildCookieString(SESSION_COOKIE_PART3_NAME, '', 0, req),
     buildCookieString(SESSION_KEY_COOKIE_NAME, '', 0, req),
   ]);
 }

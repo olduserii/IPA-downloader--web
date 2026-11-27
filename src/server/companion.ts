@@ -211,6 +211,7 @@ export async function bridgeLoginAppleId(
     status?: string;
     message?: string;
     guid?: string;
+    anisetteState?: string;
     account?: {
       email?: string;
       name?: string;
@@ -249,6 +250,9 @@ export async function bridgeLoginAppleId(
       pod: (data.account.pod || '').replace(/[^\d]/g, ''),
       storeFront: data.account.storeFront || '143469-16,32',
       guid,
+      anisetteState: typeof data.anisetteState === 'string' && data.anisetteState.trim()
+        ? data.anisetteState.trim()
+        : undefined,
       expiresAt: Date.now() + ttlMs,
       persistMode: 'keep',
     };
@@ -313,6 +317,8 @@ export async function bridgeInspectDownload(
         account: toBridgeAccount(targetSession),
         appID,
         externalVersionID,
+        guid: targetSession.guid,
+        anisetteState: targetSession.anisetteState || undefined,
       }),
       redirect: 'manual',
       signal: AbortSignal.timeout(40000),
@@ -463,6 +469,8 @@ export async function bridgePurchaseFreeLicense(
       body: JSON.stringify({
         account: toBridgeAccount(targetSession),
         appID,
+        guid: targetSession.guid,
+        anisetteState: targetSession.anisetteState || undefined,
       }),
       redirect: 'manual',
       signal: AbortSignal.timeout(30000),

@@ -38,7 +38,7 @@ import {
   normalizeCountry,
   parseCookies,
   parsePortableSessionToken,
-  SESSION_COOKIE_NAME,
+  readSessionCookieToken,
   SESSION_KEY_COOKIE_NAME,
   SESSION_TTL_24H_SEC,
   SESSION_TTL_KEEP_SEC,
@@ -113,7 +113,7 @@ function resolveSessionFromRequest(req: Request): ResolvedAuth {
     }
   }
 
-  const cookieToken = cookies[SESSION_COOKIE_NAME];
+  const cookieToken = readSessionCookieToken(cookies);
   if (cookieToken) {
     if (cookieToken.startsWith('ipav1.open.')) {
       const parsed = parsePortableSessionToken(cookieToken);
