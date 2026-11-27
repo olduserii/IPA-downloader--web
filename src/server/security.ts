@@ -9,8 +9,9 @@ const EPHEMERAL_FALLBACK = crypto.randomBytes(32);
 export const SESSION_COOKIE_NAME = 'ipavault_session';
 export const SESSION_KEY_COOKIE_NAME = 'ipavault_sk';
 
-export const SESSION_TTL_24H_SEC = 24 * 60 * 60;
-export const SESSION_TTL_KEEP_SEC = 30 * 24 * 60 * 60; // 30 days ("Не сбрасывать")
+export const SESSION_TTL_SEC = 365 * 24 * 60 * 60; // Persistent until explicit sign-out or Apple token expiry
+export const SESSION_TTL_24H_SEC = SESSION_TTL_SEC;
+export const SESSION_TTL_KEEP_SEC = SESSION_TTL_SEC;
 
 function getServerMasterKey(): Buffer | null {
   const envSecret = process.env.SESSION_SECRET?.trim();
@@ -42,6 +43,9 @@ function getManifestSigningKey(): Buffer {
   if (master) return master;
   const autoSeed =
     process.env.VERCEL_PROJECT_ID?.trim() ||
+    process.env.VERCEL_PROJECT_PRODUCTION_URL?.trim() ||
+    process.env.SAP_BRIDGE_SECRET?.trim() ||
+    process.env.SAP_BRIDGE_URL?.trim() ||
     process.env.APP_URL?.trim() ||
     '';
   if (autoSeed) {
@@ -129,20 +133,16 @@ export function decryptSessionToken(token: string, browserKeyHex?: string): Stor
 //   ipav1.pin.<salt_b64url>.<ciphertext_b64url>     (PIN-protected via scrypt)
 export function createPortableSessionToken(
   session: StoredAppleSession,
-  opts: { durationMode: '24h' | 'keep'; pin?: string }
+  opts?: { durationMode?: '24h' | 'keep'; pin?: string }
 ): { sessionString: string; expiresAt: number; pinProtected: boolean } {
-  const ttlMs =
-    opts.durationMode === 'keep'
-      ? SESSION_TTL_KEEP_SEC * 1000
-      : SESSION_TTL_24H_SEC * 1000;
-  const expiresAt = Date.now() + ttlMs;
+  const expiresAt = Date.now() + SESSION_TTL_SEC * 1000;
   const portablePayload: StoredAppleSession = {
     ...session,
     expiresAt,
-    persistMode: opts.durationMode,
+    persistMode: 'keep',
   };
 
-  const cleanPin = opts.pin?.trim() ?? '';
+  const cleanPin = opts?.pin?.trim() ?? '';
   if (cleanPin.length > 0) {
     const salt = crypto.randomBytes(16);
     const derivedKey = crypto.scryptSync(cleanPin, salt, 32);
@@ -202,8 +202,8 @@ export function parsePortableSessionToken(
           pod,
           storeFront,
           guid,
-          expiresAt: Date.now() + SESSION_TTL_KEEP_SEC * 1000,
-          persistMode: '24h',
+          expiresAt: Date.now() + SESSION_TTL_SEC * 1000,
+          persistMode: 'keep',
         },
       };
     } catch {
@@ -343,32 +343,28 @@ export function setBrowserSessionCookies(
   session: StoredAppleSession,
   existingBrowserKeyHex?: string,
   req?: Request
-): { bearerToken: string; browserKeyHex: string } {
+): { bearerToken: string; portableToken: string; browserKeyHex: string } {
   const browserKeyHex =
     existingBrowserKeyHex && /^[0-9a-f]{64}$/i.test(existingBrowserKeyHex)
       ? existingBrowserKeyHex
       : crypto.randomBytes(32).toString('hex');
 
-  // Encrypt the cookie payload with per-browser key, and encrypt the returned Bearer
-  // token with the deployment-stable key so in-memory Bearer requests never fail
-  // even if a browser blocks cookies or Vercel cold-starts a new serverless worker.
-  const cookieToken = encryptSessionToken(session, browserKeyHex);
-  const bearerToken = encryptSessionToken(session);
+  const normalizedSession: StoredAppleSession = {
+    ...session,
+    persistMode: 'keep',
+    expiresAt: Math.max(session.expiresAt, Date.now() + SESSION_TTL_SEC * 1000),
+  };
 
-  if (session.persistMode === 'memory') {
-    clearBrowserSessionCookies(res, req);
-    return { bearerToken, browserKeyHex };
-  }
-
-  const maxAgeSec =
-    session.persistMode === 'keep' ? SESSION_TTL_KEEP_SEC : SESSION_TTL_24H_SEC;
+  // Both the HttpOnly cookie and the Bearer token use the self-contained AES-256-GCM
+  // ipav1.open.* format so EVERY Vercel Serverless cold-start instance decrypts them
+  // deterministically without needing SESSION_SECRET or warm Lambda state.
+  const { sessionString: portableToken } = createPortableSessionToken(normalizedSession);
 
   res.setHeader('Set-Cookie', [
-    buildCookieString(SESSION_COOKIE_NAME, cookieToken, maxAgeSec, req),
-    buildCookieString(SESSION_KEY_COOKIE_NAME, browserKeyHex, maxAgeSec, req),
+    buildCookieString(SESSION_COOKIE_NAME, portableToken, SESSION_TTL_SEC, req),
   ]);
 
-  return { bearerToken, browserKeyHex };
+  return { bearerToken: portableToken, portableToken, browserKeyHex };
 }
 
 export function clearBrowserSessionCookies(res: Response, req?: Request): void {

@@ -172,6 +172,7 @@ export async function apiTestBridge(
 export async function apiRestoreBrowserSession(): Promise<{
   authenticated: boolean;
   token?: string;
+  portableToken?: string;
   session?: AppleSessionSummary;
   expired?: boolean;
 }> {
@@ -190,7 +191,7 @@ export async function apiLoginAppleId(params: {
   anisetteUrl?: string;
   guid?: string;
   authEndpoint?: string;
-  persistMode: SessionPersistMode;
+  persistMode?: SessionPersistMode;
   bridgeUrl?: string;
   bridgeSecret?: string;
 }): Promise<
@@ -207,7 +208,7 @@ export async function apiLoginAppleId(params: {
         bridgeSecret: params.bridgeSecret,
       }),
     },
-    body: JSON.stringify(params),
+    body: JSON.stringify({ ...params, persistMode: params.persistMode ?? 'keep' }),
   });
   return parseJson<
     AuthLoginResponse & { guid?: string; authEndpoint?: string; requiresSapBridge?: boolean }
@@ -217,13 +218,13 @@ export async function apiLoginAppleId(params: {
 export async function apiLoginWithSessionToken(params: {
   sessionString: string;
   pin?: string;
-  persistMode: SessionPersistMode;
+  persistMode?: SessionPersistMode;
 }): Promise<AuthLoginResponse & { needsPin?: boolean }> {
   const res = await fetch('/api/auth/login-session', {
     method: 'POST',
     credentials: 'include',
     headers: { 'Content-Type': 'application/json', ...CSRF_HEADERS },
-    body: JSON.stringify(params),
+    body: JSON.stringify({ ...params, persistMode: params.persistMode ?? 'keep' }),
   });
   return parseJson<AuthLoginResponse & { needsPin?: boolean }>(res);
 }

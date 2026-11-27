@@ -117,13 +117,13 @@ export default function App() {
       : null;
   });
 
-  // Automatically restore cached 24h / pinned HttpOnly browser session on page load
+  // Automatically restore browser session on page load
   useEffect(() => {
     let active = true;
     apiRestoreBrowserSession()
       .then((res) => {
         if (active && res.authenticated && res.session) {
-          setAuthToken((prev) => prev ?? res.token ?? null);
+          setAuthToken((prev) => prev ?? res.portableToken ?? res.token ?? null);
           setSession((prev) => prev ?? res.session ?? null);
         }
       })
@@ -277,11 +277,19 @@ export default function App() {
     }
   };
 
-  const handleAuthenticated = (token: string, nextSession: AppleSessionSummary) => {
+  const handleAuthenticated = (
+    token: string,
+    nextSession: AppleSessionSummary,
+    autoCopied?: boolean
+  ) => {
     setAuthToken(token);
     setSession(nextSession);
     setOwnershipCache({});
-    showToast(`Выполнен вход: ${nextSession.email}`);
+    showToast(
+      autoCopied
+        ? 'Вход выполнен — токен скопирован в буфер обмена. Сохраните его и никому не передавайте.'
+        : `Выполнен вход: ${nextSession.email}. Сохраните токен сессии и никому не передавайте.`
+    );
   };
 
   const handleSignOut = () => {

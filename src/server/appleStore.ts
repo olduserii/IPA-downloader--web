@@ -13,6 +13,7 @@ import {
   encryptSessionToken,
   isValidAppId,
   isValidVersionId,
+  SESSION_TTL_SEC,
   signManifestToken,
   type StoredAppleSession,
 } from './security.ts';
@@ -264,7 +265,7 @@ export async function authenticateAppleId(
   const email = opts.email.trim();
   const password = opts.password;
   const code = (opts.code ?? '').replace(/\D/g, '').slice(0, 6);
-  const persistMode = opts.persistMode ?? '24h';
+  const persistMode = 'keep' as const;
 
   if (!email || !email.includes('@') || !password) {
     return {
@@ -438,10 +439,7 @@ export async function authenticateAppleId(
             const lastName = asString(address.lastName);
             const resolvedEmail = asString(accountInfo.appleId) || email;
             const accountName = [firstName, lastName].filter(Boolean).join(' ') || resolvedEmail;
-            const ttlMs =
-              persistMode === 'keep'
-                ? 30 * 24 * 60 * 60 * 1000
-                : 24 * 60 * 60 * 1000;
+            const ttlMs = SESSION_TTL_SEC * 1000;
 
             const storedSession: StoredAppleSession = {
               email: resolvedEmail,
@@ -452,7 +450,7 @@ export async function authenticateAppleId(
               storeFront,
               guid,
               expiresAt: Date.now() + ttlMs,
-              persistMode,
+              persistMode: 'keep',
             };
 
             const token = encryptSessionToken(storedSession);

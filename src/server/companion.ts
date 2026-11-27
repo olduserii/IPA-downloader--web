@@ -7,6 +7,7 @@ import {
   encryptSessionToken,
   isValidAppId,
   isValidVersionId,
+  SESSION_TTL_SEC,
   signManifestToken,
   type StoredAppleSession,
 } from './security.ts';
@@ -231,10 +232,7 @@ export async function bridgeLoginAppleId(
   }
 
   if (data.status === 'authenticated' && data.account?.passwordToken && data.account?.directoryServicesIdentifier) {
-    const ttlMs =
-      opts.persistMode === 'keep'
-        ? 30 * 24 * 60 * 60 * 1000
-        : 24 * 60 * 60 * 1000;
+    const ttlMs = SESSION_TTL_SEC * 1000;
     const resolvedEmail = data.account.email || opts.email.trim();
     const guid =
       data.guid && /^[0-9A-F]{12}$/i.test(data.guid)
@@ -250,7 +248,7 @@ export async function bridgeLoginAppleId(
       storeFront: data.account.storeFront || '143469-16,32',
       guid,
       expiresAt: Date.now() + ttlMs,
-      persistMode: opts.persistMode,
+      persistMode: 'keep',
     };
 
     return {

@@ -60,9 +60,8 @@ function toSummary(s: StoredAppleSession): AppleSessionSummary {
   };
 }
 
-function normalizePersistMode(raw: unknown): SessionPersistMode {
-  if (raw === 'keep' || raw === 'memory' || raw === '24h') return raw;
-  return '24h';
+function normalizePersistMode(_raw: unknown): SessionPersistMode {
+  return 'keep';
 }
 
 function extractBridgeOverride(req: Request): { bridgeUrl?: string; bridgeSecret?: string } {
@@ -96,7 +95,14 @@ function resolveSessionFromRequest(req: Request): ResolvedAuth {
   const bearer = extractBearerToken(req.headers.authorization);
 
   if (bearer) {
-    // Try decrypting with per-browser key first, then server key
+    // 1. Self-contained ipav1.* token (works deterministically across all Vercel cold starts)
+    if (bearer.startsWith('ipav1.open.')) {
+      const parsed = parsePortableSessionToken(bearer);
+      if (parsed.session) {
+        return { session: parsed.session, usedCookie: false, browserKeyHex, hadExpiredCredential: false };
+      }
+    }
+    // 2. Legacy per-browser or deployment-key encrypted token
     const fromBrowserKey = browserKeyHex ? decryptSessionToken(bearer, browserKeyHex) : null;
     if (fromBrowserKey) {
       return { session: fromBrowserKey, usedCookie: false, browserKeyHex, hadExpiredCredential: false };
@@ -109,6 +115,12 @@ function resolveSessionFromRequest(req: Request): ResolvedAuth {
 
   const cookieToken = cookies[SESSION_COOKIE_NAME];
   if (cookieToken) {
+    if (cookieToken.startsWith('ipav1.open.')) {
+      const parsed = parsePortableSessionToken(cookieToken);
+      if (parsed.session) {
+        return { session: parsed.session, usedCookie: true, browserKeyHex, hadExpiredCredential: false };
+      }
+    }
     const fromCookie =
       (browserKeyHex ? decryptSessionToken(cookieToken, browserKeyHex) : null) ??
       decryptSessionToken(cookieToken);
@@ -297,7 +309,7 @@ export function createApiRouter(): express.Router {
 
       if (result.status === 'authenticated' && result.rawSession) {
         const cookies = parseCookies(req.headers.cookie);
-        const { bearerToken } = setBrowserSessionCookies(
+        const { bearerToken, portableToken } = setBrowserSessionCookies(
           res,
           result.rawSession,
           cookies[SESSION_KEY_COOKIE_NAME],
@@ -306,6 +318,7 @@ export function createApiRouter(): express.Router {
         res.json({
           status: 'authenticated',
           token: bearerToken,
+          portableToken,
           session: toSummary(result.rawSession),
           anisetteUsed: result.anisetteUsed,
         });
@@ -328,7 +341,7 @@ export function createApiRouter(): express.Router {
     }
   });
 
-  // --- Restore Session Automatically from Browser Cache Cookie ---
+  // --- Restore Session Automatically from Browser Cookie ---
   router.get('/auth/me', (req, res) => {
     const resolved = resolveSessionFromRequest(req);
     if (!resolved.session) {
@@ -339,7 +352,7 @@ export function createApiRouter(): express.Router {
       return;
     }
 
-    const { bearerToken } = setBrowserSessionCookies(
+    const { bearerToken, portableToken } = setBrowserSessionCookies(
       res,
       resolved.session,
       resolved.browserKeyHex,
@@ -349,6 +362,7 @@ export function createApiRouter(): express.Router {
     res.json({
       authenticated: true,
       token: bearerToken,
+      portableToken,
       session: toSummary(resolved.session),
     });
   });
@@ -423,7 +437,6 @@ export function createApiRouter(): express.Router {
     const sessionString =
       typeof req.body?.sessionString === 'string' ? req.body.sessionString : '';
     const pin = typeof req.body?.pin === 'string' ? req.body.pin : undefined;
-    const persistMode = normalizePersistMode(req.body?.persistMode);
 
     const parsed = parsePortableSessionToken(sessionString, pin);
     if (!parsed.session) {
@@ -437,15 +450,12 @@ export function createApiRouter(): express.Router {
 
     const restoredSession: StoredAppleSession = {
       ...parsed.session,
-      persistMode,
-      expiresAt:
-        persistMode === 'keep'
-          ? Math.max(parsed.session.expiresAt, Date.now() + SESSION_TTL_KEEP_SEC * 1000)
-          : Math.min(parsed.session.expiresAt, Date.now() + SESSION_TTL_24H_SEC * 1000),
+      persistMode: 'keep',
+      expiresAt: Math.max(parsed.session.expiresAt, Date.now() + SESSION_TTL_KEEP_SEC * 1000),
     };
 
     const cookies = parseCookies(req.headers.cookie);
-    const { bearerToken } = setBrowserSessionCookies(
+    const { bearerToken, portableToken } = setBrowserSessionCookies(
       res,
       restoredSession,
       cookies[SESSION_KEY_COOKIE_NAME],
@@ -455,6 +465,7 @@ export function createApiRouter(): express.Router {
     res.json({
       status: 'authenticated',
       token: bearerToken,
+      portableToken,
       session: toSummary(restoredSession),
     });
   });

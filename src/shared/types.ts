@@ -100,6 +100,7 @@ export interface AppleSessionSummary {
 export interface AuthLoginResponse {
   status: 'authenticated' | 'requires2fa' | 'error';
   token?: string;
+  portableToken?: string;
   session?: AppleSessionSummary;
   anisetteUsed?: {
     serverName: string;
