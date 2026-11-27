@@ -73,6 +73,8 @@ export interface AnisetteTestResult {
 export interface BridgeStatusResponse {
   configured: boolean;
   source: 'env' | 'none';
+  host?: string;
+  envError?: string;
 }
 
 export interface BridgeTestResult {

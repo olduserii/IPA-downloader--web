@@ -17,19 +17,79 @@ export interface BridgeConfig {
   source: 'env' | 'custom';
 }
 
-export function getEnvBridgeConfig(): BridgeConfig | null {
-  const rawUrl = process.env.SAP_BRIDGE_URL?.trim();
-  if (!rawUrl) return null;
-  try {
-    const parsed = assertSafeExternalHttpsUrl(rawUrl);
-    return {
-      baseUrl: parsed.toString().replace(/\/+$/, ''),
-      secret: process.env.SAP_BRIDGE_SECRET?.trim() || undefined,
-      source: 'env',
-    };
-  } catch {
-    return null;
+const MANAGED_PAAS_HTTPS_SUFFIXES = [
+  '.up.railway.app',
+  '.onrender.com',
+  '.fly.dev',
+  '.vercel.app',
+  '.koyeb.app',
+];
+
+/**
+ * Normalizes user-entered or env-configured bridge URLs:
+ * - Auto-prepends https:// when user pastes bare hostname (e.g. "app.up.railway.app:8080")
+ * - Upgrades http:// to https:// on managed HTTPS PaaS domains
+ * - Strips accidental internal container ports (:8080, :3000) on managed HTTPS PaaS domains
+ * - Strictly enforces HTTPS + SSRF protection via assertSafeExternalHttpsUrl
+ */
+export function normalizeBridgeUrl(raw: string): string {
+  let candidate = raw.trim();
+  if (!candidate) {
+    throw new Error('Укажите адрес FairPlay SAP Bridge');
   }
+
+  // Upgrade http:// only if user pasted it by mistake; bare hostnames get https://
+  if (/^http:\/\//i.test(candidate)) {
+    candidate = `https://${candidate.slice(7)}`;
+  } else if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(candidate)) {
+    candidate = `https://${candidate}`;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    throw new Error('Некорректный URL FairPlay SAP Bridge');
+  }
+
+  const hostLower = parsed.hostname.toLowerCase();
+  const isManagedPaas = MANAGED_PAAS_HTTPS_SUFFIXES.some((s) => hostLower.endsWith(s));
+  if (isManagedPaas && parsed.port && parsed.port !== '443') {
+    // Railway / Render / Fly terminate TLS on 443 and route internally to container PORT (e.g. 8080)
+    parsed.port = '';
+  }
+
+  const safe = assertSafeExternalHttpsUrl(parsed.toString());
+  return safe.toString().replace(/\/+$/, '');
+}
+
+export function getEnvBridgeStatus(): {
+  config: BridgeConfig | null;
+  host?: string;
+  envError?: string;
+} {
+  const rawUrl = process.env.SAP_BRIDGE_URL?.trim();
+  if (!rawUrl) return { config: null };
+  try {
+    const baseUrl = normalizeBridgeUrl(rawUrl);
+    return {
+      config: {
+        baseUrl,
+        secret: process.env.SAP_BRIDGE_SECRET?.trim() || undefined,
+        source: 'env',
+      },
+      host: new URL(baseUrl).host,
+    };
+  } catch (err) {
+    return {
+      config: null,
+      envError: err instanceof Error ? err.message : 'Некорректный SAP_BRIDGE_URL',
+    };
+  }
+}
+
+export function getEnvBridgeConfig(): BridgeConfig | null {
+  return getEnvBridgeStatus().config;
 }
 
 export function resolveBridgeConfig(override?: {
@@ -38,9 +98,9 @@ export function resolveBridgeConfig(override?: {
 }): BridgeConfig | null {
   const customUrl = override?.bridgeUrl?.trim();
   if (customUrl) {
-    const parsed = assertSafeExternalHttpsUrl(customUrl);
+    const baseUrl = normalizeBridgeUrl(customUrl);
     return {
-      baseUrl: parsed.toString().replace(/\/+$/, ''),
+      baseUrl,
       secret: override?.bridgeSecret?.trim() || undefined,
       source: 'custom',
     };
@@ -73,17 +133,42 @@ export async function testBridgeConnection(
     if (!res.ok) {
       return { ok: false, error: `Сервер моста вернул HTTP ${res.status}` };
     }
-    const data = (await res.json()) as {
+    const contentType = res.headers.get('content-type') || '';
+    const text = await res.text();
+    if (!contentType.includes('application/json') && text.trim().startsWith('<')) {
+      return {
+        ok: false,
+        error:
+          'По этому адресу сейчас отвечает веб-сайт (HTML), а не FairPlay SAP Bridge. Проверьте в Railway, что Root Directory установлен на /companion и деплой завершился успешно.',
+      };
+    }
+
+    let data: {
       ok?: boolean;
       engine?: string;
       secretProtected?: boolean;
     };
-    if (!data.ok) {
-      return { ok: false, error: 'Мост ответил некорректным статусом' };
+    try {
+      data = JSON.parse(text) as {
+        ok?: boolean;
+        engine?: string;
+        secretProtected?: boolean;
+      };
+    } catch {
+      return {
+        ok: false,
+        error: 'Сервер по указанному адресу вернул не JSON. Убедитесь, что запущен контейнер из папки /companion.',
+      };
+    }
+    if (!data.ok || data.engine !== 'ipatool-sap-bridge') {
+      return {
+        ok: false,
+        error: 'По этому адресу запущен другой сервис, а не FairPlay SAP Bridge (/companion).',
+      };
     }
     return {
       ok: true,
-      engine: data.engine || 'ipatool-sap-bridge',
+      engine: data.engine,
       secretProtected: Boolean(data.secretProtected),
       latencyMs: Math.max(1, Date.now() - started),
     };

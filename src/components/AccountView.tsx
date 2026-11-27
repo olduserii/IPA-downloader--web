@@ -108,6 +108,7 @@ export function AccountView({
 
   // FairPlay SAP Bridge state
   const [envBridgeConfigured, setEnvBridgeConfigured] = useState(false);
+  const [envBridgeHost, setEnvBridgeHost] = useState('');
   const [bridgeUrl, setBridgeUrl] = useState(() => getSavedBridgeConfig().bridgeUrl);
   const [bridgeSecret, setBridgeSecret] = useState(() => getSavedBridgeConfig().bridgeSecret);
   const [isTestingBridge, setIsTestingBridge] = useState(false);
@@ -123,7 +124,10 @@ export function AccountView({
 
   useEffect(() => {
     apiGetBridgeStatus()
-      .then((st) => setEnvBridgeConfigured(Boolean(st.configured)))
+      .then((st) => {
+        setEnvBridgeConfigured(Boolean(st.configured));
+        setEnvBridgeHost(st.host || '');
+      })
       .catch(() => {
         // ignore
       });
@@ -991,9 +995,9 @@ export function AccountView({
                   FairPlay SAP Bridge
                 </h2>
               </div>
-              {(envBridgeConfigured || bridgeUrl.trim().startsWith('https://')) && (
+              {(envBridgeConfigured || bridgeUrl.trim().length > 0) && (
                 <span className="text-[11px] font-semibold text-emerald-700 dark:text-emerald-400">
-                  {envBridgeConfigured && !bridgeUrl.trim() ? 'Vercel Env' : 'Подключён'}
+                  {envBridgeConfigured && !bridgeUrl.trim() ? 'Vercel Env' : 'Настроен'}
                 </span>
               )}
             </div>
@@ -1006,9 +1010,13 @@ export function AccountView({
             </p>
 
             {envBridgeConfigured && !bridgeUrl.trim() && (
-              <div className="p-3 rounded-xl bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-900/60 text-xs text-emerald-900 dark:text-emerald-200">
-                Мост автоматически подключён через переменную окружения{' '}
-                <span className="font-mono font-semibold">SAP_BRIDGE_URL</span> на Vercel.
+              <div className="p-3 rounded-xl bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-900/60 text-xs text-emerald-900 dark:text-emerald-200 break-all">
+                Мост подключён через <span className="font-mono font-semibold">SAP_BRIDGE_URL</span>
+                {envBridgeHost ? (
+                  <>
+                    : <span className="font-mono">{envBridgeHost}</span>
+                  </>
+                ) : null}
               </div>
             )}
 
@@ -1018,17 +1026,21 @@ export function AccountView({
                   htmlFor="sap-bridge-url"
                   className="block text-xs font-medium text-slate-600 dark:text-slate-400"
                 >
-                  HTTPS-адрес моста (опционально)
+                  Адрес моста (https:// подставится автоматически)
                 </label>
                 <input
                   id="sap-bridge-url"
-                  type="url"
+                  type="text"
+                  inputMode="url"
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  spellCheck={false}
                   value={bridgeUrl}
                   onChange={(e) => {
                     setBridgeUrl(e.target.value);
                     saveBridgeConfig(e.target.value, bridgeSecret);
                   }}
-                  placeholder="https://ipa-sap-bridge.onrender.com"
+                  placeholder="https://ipa-bridge.up.railway.app"
                   className="w-full min-h-[42px] px-3 py-2 text-xs font-mono rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-100 placeholder:text-slate-400"
                 />
               </div>

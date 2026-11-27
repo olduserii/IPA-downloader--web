@@ -23,7 +23,7 @@ import {
   syncPopularAppsListFromGitHub,
 } from './catalog.ts';
 import {
-  getEnvBridgeConfig,
+  getEnvBridgeStatus,
   resolveBridgeConfig,
   testBridgeConnection,
 } from './companion.ts';
@@ -228,10 +228,12 @@ export function createApiRouter(): express.Router {
 
   // --- FairPlay SAP Bridge Status & Test ---
   router.get('/bridge/status', (_req, res) => {
-    const envBridge = getEnvBridgeConfig();
+    const status = getEnvBridgeStatus();
     res.json({
-      configured: Boolean(envBridge),
-      source: envBridge ? 'env' : 'none',
+      configured: Boolean(status.config),
+      source: status.config ? 'env' : 'none',
+      host: status.host,
+      envError: status.envError,
     });
   });
 
