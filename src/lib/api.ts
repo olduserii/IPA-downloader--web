@@ -124,15 +124,16 @@ export async function apiLoginAppleId(params: {
   useAnisette: boolean;
   anisetteUrl?: string;
   guid?: string;
+  authEndpoint?: string;
   persistMode: SessionPersistMode;
-}): Promise<AuthLoginResponse & { guid?: string }> {
+}): Promise<AuthLoginResponse & { guid?: string; authEndpoint?: string }> {
   const res = await fetch('/api/auth/login', {
     method: 'POST',
     credentials: 'include',
     headers: { 'Content-Type': 'application/json', ...CSRF_HEADERS },
     body: JSON.stringify(params),
   });
-  return parseJson<AuthLoginResponse & { guid?: string }>(res);
+  return parseJson<AuthLoginResponse & { guid?: string; authEndpoint?: string }>(res);
 }
 
 export async function apiLoginWithSessionToken(params: {

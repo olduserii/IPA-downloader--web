@@ -214,6 +214,10 @@ export function createApiRouter(): express.Router {
         typeof req.body?.anisetteUrl === 'string' ? req.body.anisetteUrl.trim() : undefined;
       const existingGuid =
         typeof req.body?.guid === 'string' ? req.body.guid.trim() : undefined;
+      const preferredAuthEndpoint =
+        typeof req.body?.authEndpoint === 'string'
+          ? req.body.authEndpoint.trim()
+          : undefined;
       const persistMode = normalizePersistMode(req.body?.persistMode);
 
       const result = await authenticateAppleId({
@@ -223,6 +227,7 @@ export function createApiRouter(): express.Router {
         useAnisette,
         anisetteUrl,
         existingGuid,
+        preferredAuthEndpoint,
         persistMode,
       });
 
@@ -245,6 +250,7 @@ export function createApiRouter(): express.Router {
       res.status(result.status === 'error' ? 401 : 200).json({
         status: result.status,
         guid: result.guid,
+        authEndpoint: result.authEndpoint,
         anisetteUsed: result.anisetteUsed,
         message: result.message,
       });

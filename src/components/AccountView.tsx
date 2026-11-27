@@ -74,6 +74,7 @@ export function AccountView({
   const [twoFactorCode, setTwoFactorCode] = useState('');
   const [requires2FA, setRequires2FA] = useState(false);
   const [pendingGuid, setPendingGuid] = useState<string | undefined>(undefined);
+  const [pendingAuthEndpoint, setPendingAuthEndpoint] = useState<string | undefined>(undefined);
   const [loginPersistMode, setLoginPersistMode] = useState<SessionPersistMode>('24h');
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [authError, setAuthError] = useState('');
@@ -155,12 +156,14 @@ export function AccountView({
         useAnisette,
         anisetteUrl: activeAnisetteUrl || undefined,
         guid: pendingGuid,
+        authEndpoint: pendingAuthEndpoint,
         persistMode: loginPersistMode,
       });
 
       if (res.status === 'requires2fa') {
         setRequires2FA(true);
         setPendingGuid(res.guid);
+        setPendingAuthEndpoint(res.authEndpoint);
         setAuthInfo(
           res.message ||
             'Введите 6-значный код двухфакторной аутентификации (2FA) с вашего iPhone или Mac.'
@@ -173,6 +176,7 @@ export function AccountView({
         setTwoFactorCode('');
         setRequires2FA(false);
         setPendingGuid(undefined);
+        setPendingAuthEndpoint(undefined);
         onAuthenticated(res.token, res.session);
         return;
       }
@@ -770,6 +774,7 @@ export function AccountView({
                             setRequires2FA(false);
                             setTwoFactorCode('');
                             setPendingGuid(undefined);
+                            setPendingAuthEndpoint(undefined);
                             setAuthInfo('');
                             setAuthError('');
                           }}
@@ -788,7 +793,7 @@ export function AccountView({
                           Вход по сохранённой сессии
                         </h2>
                         <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
-                          Вставьте токен <span className="font-mono">ipav1…</span>, сгенерированный ранее, или загрузите его из файла, чтобы войти мгновенно без пароля и 2FA.
+                          Вставьте токен <span className="font-mono">ipav1…</span> (сгенерированный в IPA Vault) или JSON-сессию из <span className="font-mono">ipatool</span>, чтобы войти мгновенно без пароля и 2FA.
                         </p>
                       </div>
                       <button

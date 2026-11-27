@@ -158,11 +158,50 @@ export function parsePortableSessionToken(
     return { session: null, error: 'Некорректный формат токена сессии.' };
   }
 
+  // Also support importing ipatool / IPA Vault JSON session objects directly
+  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+    try {
+      const obj = JSON.parse(trimmed) as Record<string, unknown>;
+      const passwordToken = String(obj.passwordToken ?? obj.password_token ?? '').trim();
+      const dsid = String(
+        obj.directoryServicesIdentifier ?? obj.dsid ?? obj.dsPersonId ?? ''
+      ).trim();
+      const email = String(obj.email ?? obj.appleId ?? 'apple-id@icloud.com').trim();
+      const accountName = String(obj.name ?? obj.accountName ?? email).trim();
+      const pod = String(obj.pod ?? '25').replace(/[^\d]/g, '') || '25';
+      const storeFront = String(obj.storeFront ?? obj.storefront ?? '143469-16,32').trim();
+      const guid = String(obj.guid ?? crypto.randomBytes(6).toString('hex')).toUpperCase().replace(/[^0-9A-F]/g, '').slice(0, 12) || crypto.randomBytes(6).toString('hex').toUpperCase();
+
+      if (!passwordToken || !/^\d{5,20}$/.test(dsid)) {
+        return {
+          session: null,
+          error: 'JSON должен содержать поля passwordToken и directoryServicesIdentifier (или dsid).',
+        };
+      }
+
+      return {
+        session: {
+          email,
+          accountName,
+          dsid,
+          passwordToken,
+          pod,
+          storeFront,
+          guid,
+          expiresAt: Date.now() + SESSION_TTL_KEEP_SEC * 1000,
+          persistMode: '24h',
+        },
+      };
+    } catch {
+      return { session: null, error: 'Некорректный JSON сессии.' };
+    }
+  }
+
   const parts = trimmed.split('.');
   if (parts.length !== 4 || parts[0] !== 'ipav1') {
     return {
       session: null,
-      error: 'Токен должен начинаться с «ipav1.» — используйте токен, сгенерированный в настройках IPA Vault.',
+      error: 'Вставьте токен «ipav1…» (из IPA Vault) или JSON-сессию из ipatool.',
     };
   }
 

@@ -27,11 +27,9 @@ export function mapAnisetteAuthHeaders(headers: Record<string, string>): Record<
   const mapped: Record<string, string> = {};
   if (headers['X-Apple-I-MD']) {
     mapped['X-Apple-AMD'] = headers['X-Apple-I-MD'];
-    mapped['X-Apple-I-MD'] = headers['X-Apple-I-MD'];
   }
   if (headers['X-Apple-I-MD-M']) {
     mapped['X-Apple-AMD-M'] = headers['X-Apple-I-MD-M'];
-    mapped['X-Apple-I-MD-M'] = headers['X-Apple-I-MD-M'];
   }
   for (const key of ['X-Apple-I-MD-RINFO', 'X-MMe-Client-Info', 'X-Mme-Device-Id']) {
     if (headers[key]) {

@@ -12,6 +12,9 @@ import {
 } from './security.ts';
 
 const CONFIGURATOR_UA =
+  'Configurator/2.21 (Macintosh; OS X 27.0.1; 26A434) AppleWebKit/0625.2.5.11.6';
+
+const LEGACY_CONFIGURATOR_UA =
   'Configurator/2.15 (Macintosh; OS X 11.0.0; 16G29) AppleWebKit/2603.3.8';
 
 function generateDeviceGuid(): string {
@@ -54,55 +57,179 @@ function extractMinOSFromMetadata(metadata: Record<string, PlistValue>): string 
   return undefined;
 }
 
+function extractSetCookies(headers: Headers): string[] {
+  const anyHeaders = headers as Headers & { getSetCookie?: () => string[] };
+  if (typeof anyHeaders.getSetCookie === 'function') {
+    return anyHeaders.getSetCookie();
+  }
+  const combined = headers.get('set-cookie');
+  return combined ? [combined] : [];
+}
+
+function mergeCookiesIntoJar(jar: Map<string, string>, headers: Headers): void {
+  for (const rawCookie of extractSetCookies(headers)) {
+    const firstSegment = rawCookie.split(';')[0]?.trim();
+    if (!firstSegment) continue;
+    const eq = firstSegment.indexOf('=');
+    if (eq <= 0) continue;
+    const name = firstSegment.slice(0, eq).trim();
+    const val = firstSegment.slice(eq + 1).trim();
+    if (name) {
+      jar.set(name, val);
+    }
+  }
+}
+
+function serializeCookieJar(jar: Map<string, string>): string {
+  return [...jar.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
+}
+
+function extractDsidFromCookies(jar: Map<string, string>): string {
+  for (const key of jar.keys()) {
+    const match = key.match(/^mz_at(?:0|_ssl)-(\d+)$/);
+    if (match?.[1]) return match[1];
+  }
+  return '';
+}
+
+function normalizeAppleAuthRedirectUrl(rawUrl: string): string {
+  const parsed = assertAppleCdnUrl(rawUrl);
+  // Apple's legacy MZFinance authenticate route requires a trailing slash
+  // to avoid 301/302 bounce loops on pod hosts.
+  if (
+    parsed.hostname.endsWith('buy.itunes.apple.com') &&
+    parsed.pathname === '/WebObjects/MZFinance.woa/wa/authenticate'
+  ) {
+    parsed.pathname = '/WebObjects/MZFinance.woa/wa/authenticate/';
+  }
+  return parsed.toString();
+}
+
+interface ApplePlistResponse {
+  status: number;
+  root: Record<string, PlistValue>;
+  hasPlistBody: boolean;
+  headers: Headers;
+  finalUrl: string;
+  pod: string;
+  storeFront: string;
+  cookieDsid: string;
+  redirectLoopDetected?: boolean;
+}
+
 async function postApplePlist(
   initialUrl: string,
   bodyObj: Record<string, PlistValue>,
   headers: Record<string, string>,
-  maxRedirects = 4
-): Promise<{
-  status: number;
-  root: Record<string, PlistValue>;
-  headers: Headers;
-  finalUrl: string;
-}> {
-  let currentUrl = initialUrl;
+  options?: {
+    maxRedirects?: number;
+    userAgent?: string;
+    cookieJar?: Map<string, string>;
+  }
+): Promise<ApplePlistResponse> {
+  const maxRedirects = options?.maxRedirects ?? 8;
+  const userAgent = options?.userAgent ?? CONFIGURATOR_UA;
+  const cookieJar = options?.cookieJar ?? new Map<string, string>();
+
+  let currentUrl = normalizeAppleAuthRedirectUrl(initialUrl);
   const xmlBody = buildPlist(bodyObj);
+  const visitedSignatures = new Set<string>();
+
+  let lastPod = '';
+  let lastStoreFront = '';
 
   for (let hop = 0; hop <= maxRedirects; hop += 1) {
     assertAppleCdnUrl(currentUrl);
+
+    const cookieHeader = serializeCookieJar(cookieJar);
+    const hopSignature = `${currentUrl}|${cookieHeader}`;
+    if (visitedSignatures.has(hopSignature)) {
+      return {
+        status: 302,
+        root: {},
+        hasPlistBody: false,
+        headers: new Headers(),
+        finalUrl: currentUrl,
+        pod: lastPod,
+        storeFront: lastStoreFront,
+        cookieDsid: extractDsidFromCookies(cookieJar),
+        redirectLoopDetected: true,
+      };
+    }
+    visitedSignatures.add(hopSignature);
+
+    const reqHeaders: Record<string, string> = {
+      'Content-Type': 'application/x-apple-plist',
+      'User-Agent': userAgent,
+      Accept: '*/*',
+      ...headers,
+    };
+    if (cookieHeader) {
+      reqHeaders.Cookie = cookieHeader;
+    }
+
     const res = await fetch(currentUrl, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-apple-plist',
-        'User-Agent': CONFIGURATOR_UA,
-        Accept: '*/*',
-        ...headers,
-      },
+      headers: reqHeaders,
       body: xmlBody,
       redirect: 'manual',
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(12000),
     });
+
+    mergeCookiesIntoJar(cookieJar, res.headers);
+
+    const podHdr = res.headers.get('pod');
+    if (podHdr) lastPod = podHdr;
+    const sfHdr = res.headers.get('x-set-apple-store-front');
+    if (sfHdr) lastStoreFront = sfHdr;
 
     if (res.status >= 300 && res.status < 400) {
       const location = res.headers.get('location');
-      if (!location) break;
-      const nextUrl = new URL(location, currentUrl).toString();
-      assertAppleCdnUrl(nextUrl);
-      currentUrl = nextUrl;
+      if (!location) {
+        return {
+          status: res.status,
+          root: {},
+          hasPlistBody: false,
+          headers: res.headers,
+          finalUrl: currentUrl,
+          pod: lastPod,
+          storeFront: lastStoreFront,
+          cookieDsid: extractDsidFromCookies(cookieJar),
+        };
+      }
+      const resolvedNext = new URL(location.trim(), currentUrl).toString();
+      currentUrl = normalizeAppleAuthRedirectUrl(resolvedNext);
       continue;
     }
 
     const text = await res.text();
-    const parsed = text.trim().startsWith('<') ? asDict(parsePlist(text)) : {};
+    const trimmed = text.trim();
+    const hasPlistBody = trimmed.startsWith('<?xml') || trimmed.startsWith('<!DOCTYPE plist') || trimmed.startsWith('<plist');
+    const parsed = hasPlistBody ? asDict(parsePlist(trimmed)) : {};
+
     return {
       status: res.status,
       root: parsed,
+      hasPlistBody,
       headers: res.headers,
       finalUrl: currentUrl,
+      pod: lastPod || asString(parsed.pod),
+      storeFront: lastStoreFront,
+      cookieDsid: extractDsidFromCookies(cookieJar),
     };
   }
 
-  throw new Error('Слишком много перенаправлений от сервера Apple');
+  return {
+    status: 302,
+    root: {},
+    hasPlistBody: false,
+    headers: new Headers(),
+    finalUrl: currentUrl,
+    pod: lastPod,
+    storeFront: lastStoreFront,
+    cookieDsid: extractDsidFromCookies(cookieJar),
+    redirectLoopDetected: true,
+  };
 }
 
 export interface AuthenticateOptions {
@@ -112,12 +239,19 @@ export interface AuthenticateOptions {
   useAnisette?: boolean;
   anisetteUrl?: string;
   existingGuid?: string;
+  preferredAuthEndpoint?: string;
   persistMode?: '24h' | 'keep' | 'memory';
 }
 
 export async function authenticateAppleId(
   opts: AuthenticateOptions
-): Promise<AuthLoginResponse & { guid?: string; rawSession?: StoredAppleSession }> {
+): Promise<
+  AuthLoginResponse & {
+    guid?: string;
+    authEndpoint?: string;
+    rawSession?: StoredAppleSession;
+  }
+> {
   const email = opts.email.trim();
   const password = opts.password;
   const code = (opts.code ?? '').replace(/\D/g, '').slice(0, 6);
@@ -130,9 +264,10 @@ export async function authenticateAppleId(
     };
   }
 
-  const guid = opts.existingGuid && /^[0-9A-F]{12}$/i.test(opts.existingGuid)
-    ? opts.existingGuid.toUpperCase()
-    : generateDeviceGuid();
+  const guid =
+    opts.existingGuid && /^[0-9A-F]{12}$/i.test(opts.existingGuid)
+      ? opts.existingGuid.toUpperCase()
+      : generateDeviceGuid();
 
   let anisetteHeaders: Record<string, string> = {};
   let anisetteUsed: { serverName: string; latencyMs: number } | undefined;
@@ -147,128 +282,241 @@ export async function authenticateAppleId(
     }
   }
 
-  const attemptEndpoints = [
-    `https://auth.itunes.apple.com/auth/v1/native/fast?guid=${guid}`,
-    `https://p25-buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate?guid=${guid}`,
-    `https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate?guid=${guid}`,
+  const endpoints: string[] = [];
+
+  // If Step 1 already resolved the user's Apple Store pod, validate strictly and hit it directly first
+  if (opts.preferredAuthEndpoint) {
+    try {
+      const parsed = new URL(normalizeAppleAuthRedirectUrl(opts.preferredAuthEndpoint));
+      const host = parsed.hostname.toLowerCase();
+      const isAuthHost =
+        host === 'auth.itunes.apple.com' ||
+        host === 'buy.itunes.apple.com' ||
+        /^p\d+-buy\.itunes\.apple\.com$/.test(host);
+      const isAuthPath =
+        parsed.pathname === '/WebObjects/MZFinance.woa/wa/authenticate/' ||
+        parsed.pathname === '/auth/v1/native' ||
+        parsed.pathname === '/auth/v1/native/';
+      if (isAuthHost && isAuthPath) {
+        endpoints.push(parsed.toString());
+      }
+    } catch {
+      // ignore invalid endpoint hint
+    }
+  }
+
+  const defaultEndpoints = [
+    `https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate/?guid=${guid}`,
+    `https://p25-buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate/?guid=${guid}`,
+    `https://auth.itunes.apple.com/auth/v1/native?guid=${guid}`,
   ];
+  for (const ep of defaultEndpoints) {
+    if (!endpoints.includes(ep)) endpoints.push(ep);
+  }
 
-  const attemptNumber = code ? '2' : '4';
   const combinedPassword = code ? `${password}${code}` : password;
+  const headerVariants: { headers: Record<string, string>; usedAnisette: boolean; ua: string }[] =
+    Object.keys(anisetteHeaders).length > 0
+      ? [
+          { headers: anisetteHeaders, usedAnisette: true, ua: CONFIGURATOR_UA },
+          { headers: {}, usedAnisette: false, ua: CONFIGURATOR_UA },
+          { headers: anisetteHeaders, usedAnisette: true, ua: LEGACY_CONFIGURATOR_UA },
+        ]
+      : [
+          { headers: {}, usedAnisette: false, ua: CONFIGURATOR_UA },
+          { headers: {}, usedAnisette: false, ua: LEGACY_CONFIGURATOR_UA },
+        ];
 
-  const payload: Record<string, PlistValue> = {
-    appleId: email,
-    attempt: attemptNumber,
-    createSession: 'true',
-    guid,
-    password: combinedPassword,
-    rmp: '0',
-    why: 'signIn',
-  };
+  let sawRedirectLoop = false;
+  let sawEmptyOrForbidden = false;
+  let lastMessage = '';
 
-  let lastMessage = 'Не удалось выполнить вход в Apple ID.';
+  for (const endpoint of endpoints) {
+    for (const variant of headerVariants) {
+      const cookieJar = new Map<string, string>();
+      const attemptSequence = code ? ['1', '2', '4'] : ['1', '2'];
 
-  for (const endpoint of attemptEndpoints) {
-    for (const includeAnisette of Object.keys(anisetteHeaders).length > 0 ? [true, false] : [false]) {
-      try {
-        const res = await postApplePlist(
-          endpoint,
-          payload,
-          includeAnisette ? anisetteHeaders : {}
-        );
+      let targetUrl = endpoint;
 
-        const root = res.root;
-        const failureType = asString(root.failureType);
-        const customerMessage = asString(root.customerMessage);
-        const passwordToken = asString(root.passwordToken);
-        const dsid = asString(root.dsPersonId);
-        const pod = res.headers.get('pod') || asString(root.pod) || '25';
-        const storeFront = res.headers.get('x-set-apple-store-front') || '143469-16,32';
+      for (const attemptNum of attemptSequence) {
+        const payload: Record<string, PlistValue> = {
+          appleId: email,
+          attempt: attemptNum,
+          createSession: 'true',
+          guid,
+          password: combinedPassword,
+          rmp: '0',
+          why: 'signIn',
+        };
 
-        // Success!
-        if (passwordToken && dsid) {
-          const accountInfo = asDict(root.accountInfo);
-          const address = asDict(accountInfo.address);
-          const firstName = asString(address.firstName);
-          const lastName = asString(address.lastName);
-          const accountName = [firstName, lastName].filter(Boolean).join(' ') || email;
-          const ttlMs =
-            persistMode === 'keep'
-              ? 30 * 24 * 60 * 60 * 1000
-              : 24 * 60 * 60 * 1000;
+        try {
+          const res = await postApplePlist(targetUrl, payload, variant.headers, {
+            maxRedirects: 8,
+            userAgent: variant.ua,
+            cookieJar,
+          });
 
-          const storedSession: StoredAppleSession = {
-            email,
-            accountName,
-            dsid,
-            passwordToken,
-            pod: pod.replace(/[^\d]/g, '') || '25',
-            storeFront,
-            guid,
-            expiresAt: Date.now() + ttlMs,
-            persistMode,
-          };
-
-          const token = encryptSessionToken(storedSession);
-          return {
-            status: 'authenticated',
-            token,
-            rawSession: storedSession,
-            session: {
-              email: storedSession.email,
-              accountName: storedSession.accountName,
-              dsid: storedSession.dsid,
-              pod: storedSession.pod,
-              storeFront: storedSession.storeFront,
-              expiresAt: storedSession.expiresAt,
-              persistMode: storedSession.persistMode,
-            },
-            anisetteUsed: includeAnisette ? anisetteUsed : undefined,
-          };
-        }
-
-        // Check if Apple requests 2FA verification code
-        const lowerMsg = customerMessage.toLowerCase();
-        const is2FA =
-          customerMessage === 'MZFinance.BadLogin.Configurator_message' ||
-          failureType === '2034' ||
-          failureType === '5000' ||
-          lowerMsg.includes('verification code') ||
-          lowerMsg.includes('код проверки') ||
-          lowerMsg.includes('two-factor') ||
-          (failureType === '' && !passwordToken && !code && res.status === 200);
-
-        if (is2FA && !code) {
-          return {
-            status: 'requires2fa',
-            guid,
-            anisetteUsed: includeAnisette ? anisetteUsed : undefined,
-            message:
-              'Apple запросил 6-значный код двухфакторной аутентификации (2FA) с вашего доверенного устройства.',
-          };
-        }
-
-        if (customerMessage) {
-          lastMessage = customerMessage;
-          // If password is wrong, stop immediately
-          if (
-            lowerMsg.includes('password') ||
-            lowerMsg.includes('apple id') ||
-            lowerMsg.includes('incorrect') ||
-            failureType === '-5000'
-          ) {
-            return { status: 'error', message: customerMessage };
+          if (res.redirectLoopDetected) {
+            sawRedirectLoop = true;
+            break;
           }
+
+          // Keep the pod URL discovered by redirect for retry attempt
+          targetUrl = res.finalUrl;
+
+          if (!res.hasPlistBody) {
+            if (res.status === 403 || res.status === 204 || res.status === 200) {
+              sawEmptyOrForbidden = true;
+            }
+            break;
+          }
+
+          const root = res.root;
+          const failureType = asString(root.failureType);
+          const customerMessage = asString(root.customerMessage);
+          const dialog = asDict(root.dialog);
+          const dialogMessage = asString(dialog.message);
+          const dialogExplanation = asString(dialog.explanation);
+          const passwordToken = asString(root.passwordToken);
+          const dsid =
+            asString(root.dsPersonId) ||
+            res.headers.get('x-dsid') ||
+            res.cookieDsid;
+
+          const podFromHost = (() => {
+            try {
+              const host = new URL(res.finalUrl).hostname;
+              const m = host.match(/^p(\d+)-buy\.itunes\.apple\.com$/i);
+              return m?.[1] || '';
+            } catch {
+              return '';
+            }
+          })();
+
+          const pod = (res.pod || podFromHost || '25').replace(/[^\d]/g, '') || '25';
+          const storeFront = res.storeFront || '143469-16,32';
+
+          // Success!
+          if (passwordToken && dsid) {
+            const accountInfo = asDict(root.accountInfo);
+            const address = asDict(accountInfo.address);
+            const firstName = asString(address.firstName);
+            const lastName = asString(address.lastName);
+            const resolvedEmail = asString(accountInfo.appleId) || email;
+            const accountName = [firstName, lastName].filter(Boolean).join(' ') || resolvedEmail;
+            const ttlMs =
+              persistMode === 'keep'
+                ? 30 * 24 * 60 * 60 * 1000
+                : 24 * 60 * 60 * 1000;
+
+            const storedSession: StoredAppleSession = {
+              email: resolvedEmail,
+              accountName,
+              dsid,
+              passwordToken,
+              pod,
+              storeFront,
+              guid,
+              expiresAt: Date.now() + ttlMs,
+              persistMode,
+            };
+
+            const token = encryptSessionToken(storedSession);
+            return {
+              status: 'authenticated',
+              token,
+              rawSession: storedSession,
+              session: {
+                email: storedSession.email,
+                accountName: storedSession.accountName,
+                dsid: storedSession.dsid,
+                pod: storedSession.pod,
+                storeFront: storedSession.storeFront,
+                expiresAt: storedSession.expiresAt,
+                persistMode: storedSession.persistMode,
+              },
+              anisetteUsed: variant.usedAnisette ? anisetteUsed : undefined,
+            };
+          }
+
+          // Apple explicitly asks for retry with attempt=2 when attempt=1 gets -5000
+          if (attemptNum === '1' && failureType === '-5000') {
+            continue;
+          }
+
+          // Genuine 2FA challenge (ONLY when Apple returned a real plist response!)
+          const lowerMsg = `${customerMessage} ${dialogMessage} ${dialogExplanation}`.toLowerCase();
+          const is2FA =
+            customerMessage === 'MZFinance.BadLogin.Configurator_message' ||
+            failureType === '2034' ||
+            lowerMsg.includes('verification code') ||
+            lowerMsg.includes('код проверки') ||
+            lowerMsg.includes('two-factor');
+
+          if (is2FA) {
+            if (!code) {
+              return {
+                status: 'requires2fa',
+                guid,
+                authEndpoint: res.finalUrl,
+                anisetteUsed: variant.usedAnisette ? anisetteUsed : undefined,
+                message:
+                  'Apple запросил 6-значный код двухфакторной аутентификации (2FA) с вашего доверенного устройства.',
+              };
+            }
+            return {
+              status: 'error',
+              message:
+                'Apple не принял код 2FA (возможно, он истёк или введён неверно). Запросите свежий 6-значный код и попробуйте снова.',
+            };
+          }
+
+          const readableMsg =
+            [dialogMessage, dialogExplanation].filter(Boolean).join(': ') || customerMessage;
+          if (readableMsg) {
+            lastMessage = readableMsg;
+            if (
+              lowerMsg.includes('disabled') ||
+              lowerMsg.includes('locked') ||
+              lowerMsg.includes('password') ||
+              lowerMsg.includes('incorrect') ||
+              failureType === '-5000'
+            ) {
+              return { status: 'error', message: readableMsg };
+            }
+          }
+          break;
+        } catch (err) {
+          lastMessage = err instanceof Error ? err.message : String(err);
+          break;
         }
-      } catch (err) {
-        lastMessage = err instanceof Error ? err.message : String(err);
       }
     }
   }
 
+  if (lastMessage) {
+    return { status: 'error', message: lastMessage };
+  }
+
+  if (sawEmptyOrForbidden) {
+    return {
+      status: 'error',
+      message:
+        'Сервер Apple отклонил прямой вход с облачного IP (HTTP 403 / пустой ответ — Apple требует FairPlay SAP-подпись устройства). Вы можете переключить сервер Anisette или войти мгновенно через вкладку «Вход по сессии» с токеном из ipatool / IPA Vault.',
+    };
+  }
+
+  if (sawRedirectLoop) {
+    return {
+      status: 'error',
+      message:
+        'Сервер Apple зациклил перенаправление между pod-узлами. Попробуйте сбросить 2FA, сменить сервер SideStore Anisette или войти через вкладку «Вход по сессии».',
+    };
+  }
+
   return {
     status: 'error',
-    message: lastMessage,
+    message: 'Не удалось выполнить вход в Apple ID. Попробуйте повторить позже.',
   };
 }
 
@@ -389,7 +637,6 @@ export async function fetchDownloadDescriptor(
     try {
       let res = await postApplePlist(tier.url, body, baseHeaders);
 
-      // 2042 recovery with hasBeenAuthedForBuy
       if (asString(res.root.failureType) === '2042') {
         res = await postApplePlist(
           tier.url,
@@ -415,7 +662,6 @@ export async function fetchDownloadDescriptor(
       const rawUrl = asString(item.URL);
       if (!rawUrl) continue;
 
-      // Strict Apple CDN host validation
       const safeCdnUrl = assertAppleCdnUrl(rawUrl).toString();
       const metadata = asDict(item.metadata);
 
@@ -443,7 +689,6 @@ export async function fetchDownloadDescriptor(
         (a, b) => Number(b) - Number(a)
       );
 
-      // Inject user Apple ID into metadata plist (same as IPA Vault / ipatool)
       const enrichedMetadata: Record<string, PlistValue> = {
         ...metadata,
         'apple-id': session.email,
@@ -546,7 +791,6 @@ export async function purchaseFreeLicense(
     );
   }
 
-  // Status 0 or "already purchased" / jingleDocType purchaseSuccess
   const statusVal = asString(res.root.status);
   const docType = asString(res.root.jingleDocType);
   if (
