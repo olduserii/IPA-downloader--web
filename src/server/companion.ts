@@ -244,7 +244,9 @@ export async function bridgeLoginAppleId(
       accountName: data.account.name || resolvedEmail,
       dsid: data.account.directoryServicesIdentifier,
       passwordToken: data.account.passwordToken,
-      pod: (data.account.pod || '25').replace(/[^\d]/g, '') || '25',
+      // Preserve Apple's exact pod (empty string when native auth omits pod -> buy.itunes.apple.com).
+      // Never invent "25", which routes non-p25 accounts to the wrong pod and triggers Apple 2034!
+      pod: (data.account.pod || '').replace(/[^\d]/g, ''),
       storeFront: data.account.storeFront || '143469-16,32',
       guid,
       expiresAt: Date.now() + ttlMs,
@@ -303,29 +305,47 @@ export async function bridgeInspectDownload(
     throw new Error('Некорректный External Version ID');
   }
 
-  const res = await fetch(`${config.baseUrl}/v1/store/inspect`, {
-    method: 'POST',
-    headers: buildBridgeHeaders(config.secret),
-    body: JSON.stringify({
-      account: toBridgeAccount(session),
-      appID,
-      externalVersionID,
-    }),
-    redirect: 'manual',
-    signal: AbortSignal.timeout(40000),
-  });
+  async function callInspect(targetSession: StoredAppleSession) {
+    const res = await fetch(`${config.baseUrl}/v1/store/inspect`, {
+      method: 'POST',
+      headers: buildBridgeHeaders(config.secret),
+      body: JSON.stringify({
+        account: toBridgeAccount(targetSession),
+        appID,
+        externalVersionID,
+      }),
+      redirect: 'manual',
+      signal: AbortSignal.timeout(40000),
+    });
 
-  const data = (await res.json().catch(() => ({}))) as {
-    url?: string;
-    md5?: string;
-    artworkUrl?: string;
-    sinfCount?: number;
-    metadata?: Record<string, unknown>;
-    availableVersions?: string[];
-    externalVersionId?: string;
-    code?: string;
-    error?: string;
-  };
+    const data = (await res.json().catch(() => ({}))) as {
+      url?: string;
+      md5?: string;
+      artworkUrl?: string;
+      sinfCount?: number;
+      metadata?: Record<string, unknown>;
+      availableVersions?: string[];
+      externalVersionId?: string;
+      code?: string;
+      error?: string;
+    };
+    return { res, data };
+  }
+
+  let { res, data } = await callInspect(session);
+
+  // Automatic recovery for tokens saved with a forced/stale pod (e.g. legacy "25"):
+  // retry once with pod="" so ipatool hits buy.itunes.apple.com directly.
+  if ((!res.ok || !data.url) && session.pod && data.code === 'sessionExpired') {
+    const retry = await callInspect({ ...session, pod: '' });
+    if (retry.res.ok && retry.data.url) {
+      res = retry.res;
+      data = retry.data;
+    } else if (retry.data.code && retry.data.code !== 'sessionExpired') {
+      res = retry.res;
+      data = retry.data;
+    }
+  }
 
   if (!res.ok || !data.url) {
     const err = new Error(data.error || `FairPlay SAP Bridge вернул HTTP ${res.status}`) as Error & {
@@ -436,23 +456,38 @@ export async function bridgePurchaseFreeLicense(
   session: StoredAppleSession,
   appID: string
 ): Promise<{ ok: boolean; message: string }> {
-  const res = await fetch(`${config.baseUrl}/v1/store/purchase`, {
-    method: 'POST',
-    headers: buildBridgeHeaders(config.secret),
-    body: JSON.stringify({
-      account: toBridgeAccount(session),
-      appID,
-    }),
-    redirect: 'manual',
-    signal: AbortSignal.timeout(30000),
-  });
+  async function callPurchase(targetSession: StoredAppleSession) {
+    const res = await fetch(`${config.baseUrl}/v1/store/purchase`, {
+      method: 'POST',
+      headers: buildBridgeHeaders(config.secret),
+      body: JSON.stringify({
+        account: toBridgeAccount(targetSession),
+        appID,
+      }),
+      redirect: 'manual',
+      signal: AbortSignal.timeout(30000),
+    });
 
-  const data = (await res.json().catch(() => ({}))) as {
-    ok?: boolean;
-    message?: string;
-    code?: string;
-    error?: string;
-  };
+    const data = (await res.json().catch(() => ({}))) as {
+      ok?: boolean;
+      message?: string;
+      code?: string;
+      error?: string;
+    };
+    return { res, data };
+  }
+
+  let { res, data } = await callPurchase(session);
+  if ((!res.ok || !data.ok) && session.pod && data.code === 'sessionExpired') {
+    const retry = await callPurchase({ ...session, pod: '' });
+    if (retry.res.ok && retry.data.ok) {
+      res = retry.res;
+      data = retry.data;
+    } else if (retry.data.code && retry.data.code !== 'sessionExpired') {
+      res = retry.res;
+      data = retry.data;
+    }
+  }
 
   if (!res.ok || !data.ok) {
     const err = new Error(data.error || `FairPlay SAP Bridge вернул HTTP ${res.status}`) as Error & {

@@ -376,7 +376,7 @@ export function AccountView({
                   <div>
                     <div className="text-slate-400 dark:text-slate-500">Apple Pod</div>
                     <div className="font-mono font-semibold text-slate-900 dark:text-slate-100 mt-0.5">
-                      p{session.pod}-buy.itunes.apple.com
+                      {session.pod ? `p${session.pod}-buy.itunes.apple.com` : 'buy.itunes.apple.com (авто)'}
                     </div>
                   </div>
                 </div>

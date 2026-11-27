@@ -182,7 +182,7 @@ export function parsePortableSessionToken(
       ).trim();
       const email = String(obj.email ?? obj.appleId ?? 'apple-id@icloud.com').trim();
       const accountName = String(obj.name ?? obj.accountName ?? email).trim();
-      const pod = String(obj.pod ?? '25').replace(/[^\d]/g, '') || '25';
+      const pod = String(obj.pod ?? '').replace(/[^\d]/g, '');
       const storeFront = String(obj.storeFront ?? obj.storefront ?? '143469-16,32').trim();
       const guid = String(obj.guid ?? crypto.randomBytes(6).toString('hex')).toUpperCase().replace(/[^0-9A-F]/g, '').slice(0, 12) || crypto.randomBytes(6).toString('hex').toUpperCase();
 

@@ -428,7 +428,7 @@ export async function authenticateAppleId(
             }
           })();
 
-          const pod = (res.pod || podFromHost || '25').replace(/[^\d]/g, '') || '25';
+          const pod = (res.pod || podFromHost || '').replace(/[^\d]/g, '');
           const storeFront = res.storeFront || '143469-16,32';
 
           // Success!
@@ -625,9 +625,10 @@ export async function fetchDownloadDescriptor(
     } catch (err) {
       const code = (err as Error & { bridgeCode?: string })?.bridgeCode;
       if (code === 'sessionExpired') {
+        const detail = err instanceof Error && err.message ? ` (${err.message})` : '';
         throw new AppleStoreError(
           'sessionExpired',
-          'Сессия Apple ID истекла — выполните повторный вход на вкладке «Аккаунт».'
+          `Сессия Apple ID истекла — выполните повторный вход на вкладке «Аккаунт».${detail}`
         );
       }
       if (code === 'licenseRequired') {

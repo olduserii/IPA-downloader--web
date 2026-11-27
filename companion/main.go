@@ -115,6 +115,7 @@ func (m *memoryKeychain) Remove(key string) error {
 type pendingAuthEntry struct {
 	store     appstore.AppStore
 	guid      string
+	account   *appstore.Account
 	expiresAt time.Time
 }
 
@@ -168,10 +169,10 @@ func newActiveSessionCache() *activeSessionCache {
 	return &activeSessionCache{entries: make(map[string]pendingAuthEntry)}
 }
 
-func (c *activeSessionCache) Get(dsid string) (appstore.AppStore, bool) {
+func (c *activeSessionCache) Get(dsid string) (appstore.AppStore, *appstore.Account, bool) {
 	key := strings.TrimSpace(dsid)
 	if key == "" {
-		return nil, false
+		return nil, nil, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -183,21 +184,28 @@ func (c *activeSessionCache) Get(dsid string) (appstore.AppStore, bool) {
 	}
 	entry, ok := c.entries[key]
 	if !ok {
-		return nil, false
+		return nil, nil, false
 	}
-	return entry.store, true
+	return entry.store, entry.account, true
 }
 
-func (c *activeSessionCache) Put(dsid string, store appstore.AppStore, guid string) {
+func (c *activeSessionCache) Put(dsid string, store appstore.AppStore, guid string, acc *appstore.Account) {
 	key := strings.TrimSpace(dsid)
 	if key == "" || store == nil {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	var accCopy *appstore.Account
+	if acc != nil {
+		cp := *acc
+		cp.Password = ""
+		accCopy = &cp
+	}
 	c.entries[key] = pendingAuthEntry{
 		store:     store,
 		guid:      guid,
+		account:   accCopy,
 		expiresAt: time.Now().Add(24 * time.Hour),
 	}
 }
@@ -335,15 +343,16 @@ func main() {
 
 		pending2FA.Delete(email)
 
-		// Cache authenticated cookieJar/store in RAM by DSID so inspect & purchase
-		// reuse Apple's session cookies seamlessly without re-provisioning.
-		if out.Account.DirectoryServicesID != "" {
-			activeSessions.Put(out.Account.DirectoryServicesID, store, guid)
-		}
-
 		// Never echo the raw Apple ID password back over HTTP
 		acc := out.Account
 		acc.Password = ""
+
+		// Cache authenticated cookieJar/store and exact Apple-returned Account in RAM by DSID
+		// so inspect & purchase reuse Apple's session cookies, real Pod, and real StoreFront.
+		if acc.DirectoryServicesID != "" {
+			activeSessions.Put(acc.DirectoryServicesID, store, guid, &acc)
+		}
+
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status":  "authenticated",
 			"account": acc,
@@ -366,7 +375,7 @@ func main() {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "Invalid appID"})
 			return
 		}
-		store, ok := activeSessions.Get(req.Account.DirectoryServicesID)
+		store, cachedAcc, ok := activeSessions.Get(req.Account.DirectoryServicesID)
 		if !ok {
 			var guid string
 			store, guid, err = newEphemeralStore()
@@ -374,7 +383,15 @@ func main() {
 				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 				return
 			}
-			activeSessions.Put(req.Account.DirectoryServicesID, store, guid)
+			activeSessions.Put(req.Account.DirectoryServicesID, store, guid, nil)
+		}
+		accountToUse := req.Account
+		if cachedAcc != nil && cachedAcc.PasswordToken == req.Account.PasswordToken {
+			// Preserve exact Pod and StoreFront returned by Apple on login
+			accountToUse.Pod = cachedAcc.Pod
+			if cachedAcc.StoreFront != "" {
+				accountToUse.StoreFront = cachedAcc.StoreFront
+			}
 		}
 		type inspector interface {
 			InspectDownload(context.Context, appstore.Account, int64, string) (appstore.InspectDownloadOutput, error)
@@ -386,7 +403,7 @@ func main() {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 35*time.Second)
 		defer cancel()
-		out, err := insp.InspectDownload(ctx, req.Account, appID, strings.TrimSpace(req.ExternalVersionID))
+		out, err := insp.InspectDownload(ctx, accountToUse, appID, strings.TrimSpace(req.ExternalVersionID))
 		if err != nil {
 			code := "unavailable"
 			status := http.StatusBadRequest
@@ -418,7 +435,7 @@ func main() {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "Invalid appID"})
 			return
 		}
-		store, ok := activeSessions.Get(req.Account.DirectoryServicesID)
+		store, cachedAcc, ok := activeSessions.Get(req.Account.DirectoryServicesID)
 		if !ok {
 			var guid string
 			store, guid, err = newEphemeralStore()
@@ -426,10 +443,17 @@ func main() {
 				writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
 				return
 			}
-			activeSessions.Put(req.Account.DirectoryServicesID, store, guid)
+			activeSessions.Put(req.Account.DirectoryServicesID, store, guid, nil)
+		}
+		accountToUse := req.Account
+		if cachedAcc != nil && cachedAcc.PasswordToken == req.Account.PasswordToken {
+			accountToUse.Pod = cachedAcc.Pod
+			if cachedAcc.StoreFront != "" {
+				accountToUse.StoreFront = cachedAcc.StoreFront
+			}
 		}
 		err = store.Purchase(appstore.PurchaseInput{
-			Account:  req.Account,
+			Account:  accountToUse,
 			App:      appstore.App{ID: appID},
 			Platform: appstore.PlatformIPhone,
 		})
