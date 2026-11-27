@@ -1,11 +1,29 @@
-<div align="center">
+# IPA Vault Web
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+Современное веб-приложение для скачивания `.ipa` напрямую с серверов Apple, работы с удалёнными приложениями App Store, историей версий (`External Version ID`) и прямой установкой на iPhone через OTA (`itms-services://`).
 
-  <h1>Built with AI Studio</h2>
+Полный порт функциональности iOS-приложения `IPA-download-ios-app` в быстрое браузерное приложение на TypeScript, React 19, Vite и Express Serverless, готовое к мгновенному деплою на **Vercel**.
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+## Возможности
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
+- **Списки популярных и удалённых приложений**: встроенный каталог из 714 приложений (`AppsList.txt`), обновление списка с GitHub в один клик, поддержка пользовательских `.txt`-списков (`Название: AppID | 15-16=ExtVerID`).
+- **Пакетная проверка App Store (RU → US)**: автоматическое определение статуса доступности (`В App Store (RU)`, `Удалено в RU · US`, `Удалено из App Store`) и проверка наличия лицензии на аккаунте.
+- **Прямая загрузка IPA с серверов Apple**: скачивание напрямую с официального CDN Apple без прокси-ограничений трафика, плюс выгрузка `iTunesMetadata.plist`.
+- **Установка на iPhone (галка OTA)**: включите переключатель «Установить приложение на iPhone», чтобы установить приложение прямо с серверов Apple через `itms-services://` и подписанный `manifest.plist` (с QR-кодом при работе с компьютера).
+- **Поиск по App Store и история версий**: поиск по регионам (`RU`, `US`, `KZ`, `TR`, `GB`, `DE`, `JP`), автоматическая подгрузка исторических `External Version ID` и бесплатное добавление лицензии на Apple ID.
+- **SideStore Anisette с failover**: параллельный опрос серверов Anisette для надёжного входа в Apple ID (включая 2FA).
 
-</div>
+## Быстрый деплой на Vercel
+
+1. Загрузите репозиторий на GitHub.
+2. Откройте [vercel.com/new](https://vercel.com/new) и импортируйте репозиторий.
+3. Нажмите **Deploy** — сайт, API (`/api/*`), кэширование сессий на 24 часа и OTA-установка на iPhone заработают автоматически без ручной настройки переменных окружения.
+
+## Локальный запуск
+
+```bash
+npm install
+npm run dev
+```
+
+Приложение откроется на `http://localhost:3000`.

@@ -1,0 +1,6 @@
+{
+  "name": "IPA Vault",
+  "description": "Веб-приложение для скачивания IPA-файлов напрямую с серверов Apple, поиска удалённых приложений App Store и установки на iPhone (OTA).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
