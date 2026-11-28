@@ -654,7 +654,7 @@ export function createApiRouter(): express.Router {
       await Promise.all(
         chunk.map(async (id) => {
           try {
-            const desc = await fetchDownloadDescriptor(session, id, '', bridgeOverride);
+            const desc = await fetchDownloadDescriptor(session, id, '', bridgeOverride, true);
             statuses[id] = 'owned';
             if (desc.iconURL) icons[id] = desc.iconURL;
           } catch (err) {

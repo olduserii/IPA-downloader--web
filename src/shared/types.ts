@@ -125,6 +125,8 @@ export interface DownloadDescriptorResult {
   externalVersionID: string;
   availableVersionIDs: string[];
   directCdnUrl: string;
+  rawAppleCdnUrl?: string;
+  sinfPatched?: boolean;
   manifestToken: string;
   manifestPath: string;
   md5?: string;

@@ -441,7 +441,7 @@ export function ExtractorView({
                   <div>
                     <div className="text-slate-400 dark:text-slate-500">Подписи SINF</div>
                     <div className="font-mono font-semibold text-slate-900 dark:text-slate-100 mt-0.5 tabular-nums">
-                      {descriptor.sinfCount} шт.
+                      {descriptor.sinfCount} шт.{descriptor.sinfPatched ? ' · вшита' : ''}
                     </div>
                   </div>
                 </div>
@@ -524,10 +524,14 @@ export function ExtractorView({
                 <>
                   <div className="space-y-1">
                     <h3 className="text-base font-bold text-slate-900 dark:text-slate-50">
-                      Загрузка напрямую с серверов Apple
+                      {descriptor.sinfPatched
+                        ? 'Подписанный IPA (FairPlay SINF)'
+                        : 'Загрузка напрямую с серверов Apple'}
                     </h3>
                     <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
-                      Файл отдаётся напрямую с официального CDN Apple на максимальной скорости телефона или ПК без проксирования.
+                      {descriptor.sinfPatched
+                        ? 'Сервер автоматически вшивает вашу подпись FairPlay SINF, iTunesMetadata.plist и иконку внутрь .ipa — приложение откроется на iPhone без вылетов (в App Store на iPhone должен быть выполнен вход в этот же Apple ID).'
+                        : 'Файл отдаётся с серверов Apple. Для запуска без вылетов подключите обновлённый FairPlay SAP Bridge.'}
                     </p>
                   </div>
 
@@ -552,7 +556,7 @@ export function ExtractorView({
                         Установить приложение на iPhone
                       </span>
                       <span className="block text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
-                        Устанавливает приложение напрямую с серверов Apple через OTA-манифест (<span className="font-mono">itms-services://</span>). Если снять галку — скачается файл <span className="font-mono">.ipa</span>.
+                        Устанавливает подписанный <span className="font-mono">.ipa</span> через OTA-манифест (<span className="font-mono">itms-services://</span>). Если снять галку — скачается готовый подписанный файл <span className="font-mono">.ipa</span>.
                       </span>
                     </div>
                   </label>

@@ -609,7 +609,8 @@ export async function fetchDownloadDescriptor(
   session: StoredAppleSession,
   appID: string,
   externalVersionID = '',
-  bridgeOverride?: { bridgeUrl?: string; bridgeSecret?: string }
+  bridgeOverride?: { bridgeUrl?: string; bridgeSecret?: string },
+  skipPrepare = false
 ): Promise<DownloadDescriptorResult> {
   if (!isValidAppId(appID)) {
     throw new AppleStoreError('invalidResponse', 'Некорректный App ID');
@@ -621,7 +622,7 @@ export async function fetchDownloadDescriptor(
   const bridge = resolveBridgeConfig(bridgeOverride);
   if (bridge) {
     try {
-      return await bridgeInspectDownload(bridge, session, appID, externalVersionID);
+      return await bridgeInspectDownload(bridge, session, appID, externalVersionID, { skipPrepare });
     } catch (err) {
       const code = (err as Error & { bridgeCode?: string })?.bridgeCode;
       if (code === 'sessionExpired') {

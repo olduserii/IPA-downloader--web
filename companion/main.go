@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +13,8 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,7 +25,11 @@ import (
 	"github.com/majd/ipatool/v2/pkg/util/operatingsystem"
 )
 
-const anisetteKeyName = "anisette-v4"
+const (
+	anisetteKeyName = "anisette-v4"
+	maxCachedIpas   = 3
+	ipaTicketTTL    = 90 * time.Minute
+)
 
 // memoryCookieJar wraps net/http/cookiejar to satisfy ipatool's pkg/http.CookieJar interface.
 type memoryCookieJar struct {
@@ -250,6 +258,206 @@ func (c *activeSessionCache) Put(dsid string, store appstore.AppStore, kc *memor
 	}
 }
 
+type ipaBuilder interface {
+	BuildPatchedIPA(context.Context, appstore.Account, appstore.InspectDownloadOutput, string) error
+}
+
+// ipaTicket stores a short-lived unguessable capability token (256-bit random hex)
+// that downloads, injects FairPlay SC_Info/*.sinf + iTunesMetadata.plist + iTunesArtwork,
+// and streams the patched .ipa to Safari or iOS itunesstored (with full Range support).
+type ipaTicket struct {
+	id        string
+	filename  string
+	filePath  string
+	store     appstore.AppStore
+	account   appstore.Account
+	inspect   appstore.InspectDownloadOutput
+	createdAt time.Time
+	expiresAt time.Time
+
+	startOnce sync.Once
+	readyCh   chan struct{}
+	buildErr  error
+}
+
+func (t *ipaTicket) startBuildAsync(buildSem chan struct{}) {
+	t.startOnce.Do(func() {
+		go func() {
+			defer close(t.readyCh)
+			buildSem <- struct{}{}
+			defer func() { <-buildSem }()
+
+			builder, ok := t.store.(ipaBuilder)
+			if !ok {
+				t.buildErr = errors.New("BuildPatchedIPA not compiled in")
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			if err := builder.BuildPatchedIPA(ctx, t.account, t.inspect, t.filePath); err != nil {
+				t.buildErr = err
+				log.Printf("patched IPA build failed (%s): %v", t.filename, err)
+				return
+			}
+			log.Printf("patched IPA ready (%s, sinfs=%d)", t.filename, t.inspect.SinfCount)
+		}()
+	})
+}
+
+func (t *ipaTicket) waitReady(ctx context.Context, buildSem chan struct{}) (string, error) {
+	t.startBuildAsync(buildSem)
+	select {
+	case <-t.readyCh:
+		if t.buildErr != nil {
+			return "", t.buildErr
+		}
+		return t.filePath, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+type ipaTicketCache struct {
+	mu       sync.Mutex
+	tickets  map[string]*ipaTicket
+	buildSem chan struct{}
+}
+
+func newIpaTicketCache() *ipaTicketCache {
+	// Serialize heavy ZIP/SINF builds to 2 concurrent jobs max to stay within container RAM
+	return &ipaTicketCache{
+		tickets:  make(map[string]*ipaTicket),
+		buildSem: make(chan struct{}, 2),
+	}
+}
+
+func isValidTicketID(id string) bool {
+	if len(id) != 64 {
+		return false
+	}
+	for _, c := range id {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+func sanitizeIpaFilename(appID string, ver string, metadata map[string]interface{}) string {
+	rawName := ""
+	for _, k := range []string{"softwareVersionBundleId", "itemName"} {
+		if v, ok := metadata[k].(string); ok && strings.TrimSpace(v) != "" {
+			rawName = strings.TrimSpace(v)
+			break
+		}
+	}
+	var b strings.Builder
+	for _, r := range rawName {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '-' || r == '_' {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('_')
+		}
+		if b.Len() >= 48 {
+			break
+		}
+	}
+	prefix := strings.Trim(b.String(), "._-")
+	if prefix == "" {
+		prefix = "App"
+	}
+	if ver != "" {
+		return fmt.Sprintf("%s-%s-%s.ipa", prefix, appID, ver)
+	}
+	return fmt.Sprintf("%s-%s.ipa", prefix, appID)
+}
+
+func (c *ipaTicketCache) Create(
+	store appstore.AppStore,
+	acc appstore.Account,
+	appID string,
+	out appstore.InspectDownloadOutput,
+) (*ipaTicket, error) {
+	randBytes := make([]byte, 32)
+	if _, err := rand.Read(randBytes); err != nil {
+		return nil, err
+	}
+	id := hex.EncodeToString(randBytes)
+	filename := sanitizeIpaFilename(appID, out.ExternalVersionID, out.Metadata)
+	filePath := filepath.Join(os.TempDir(), fmt.Sprintf("ipavault-ipa-%s.ipa", id))
+	now := time.Now()
+
+	accCopy := acc
+	accCopy.Password = ""
+
+	ticket := &ipaTicket{
+		id:        id,
+		filename:  filename,
+		filePath:  filePath,
+		store:     store,
+		account:   accCopy,
+		inspect:   out,
+		createdAt: now,
+		expiresAt: now.Add(ipaTicketTTL),
+		readyCh:   make(chan struct{}),
+	}
+
+	c.mu.Lock()
+	c.cleanupLocked(now)
+	c.tickets[id] = ticket
+	c.evictOverflowLocked()
+	c.mu.Unlock()
+
+	return ticket, nil
+}
+
+func (c *ipaTicketCache) Get(id string) (*ipaTicket, bool) {
+	if !isValidTicketID(id) {
+		return nil, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	c.cleanupLocked(now)
+	t, ok := c.tickets[id]
+	return t, ok
+}
+
+func (c *ipaTicketCache) cleanupLocked(now time.Time) {
+	for id, t := range c.tickets {
+		if now.After(t.expiresAt) {
+			delete(c.tickets, id)
+			_ = os.Remove(t.filePath)
+			_ = os.Remove(t.filePath + ".raw")
+			_ = os.Remove(t.filePath + ".tmp")
+		}
+	}
+}
+
+func (c *ipaTicketCache) evictOverflowLocked() {
+	if len(c.tickets) <= maxCachedIpas {
+		return
+	}
+	all := make([]*ipaTicket, 0, len(c.tickets))
+	for _, t := range c.tickets {
+		all = append(all, t)
+	}
+	sort.Slice(all, func(i, j int) bool {
+		return all[i].createdAt.Before(all[j].createdAt)
+	})
+	for len(all) > maxCachedIpas {
+		oldest := all[0]
+		all = all[1:]
+		delete(c.tickets, oldest.id)
+		// Only delete finished file; active builds clean up after expiry
+		select {
+		case <-oldest.readyCh:
+			_ = os.Remove(oldest.filePath)
+		default:
+		}
+	}
+}
+
 func newEphemeralStore(preferredGuid string, initialAnisette []byte) (appstore.AppStore, *memoryKeychain, string, error) {
 	osSvc := operatingsystem.New()
 	var mach machine.Machine = machine.New(machine.Args{OS: osSvc})
@@ -318,6 +526,7 @@ type inspectReq struct {
 	ExternalVersionID string           `json:"externalVersionID"`
 	GUID              string           `json:"guid,omitempty"`
 	AnisetteState     string           `json:"anisetteState,omitempty"`
+	SkipPrepare       bool             `json:"skipPrepare,omitempty"`
 }
 
 type purchaseReq struct {
@@ -335,6 +544,7 @@ func main() {
 	bridgeSecret := strings.TrimSpace(os.Getenv("BRIDGE_SECRET"))
 	pending2FA := newPendingAuthCache()
 	activeSessions := newActiveSessionCache()
+	ipaTickets := newIpaTicketCache()
 
 	mux := http.NewServeMux()
 
@@ -343,8 +553,43 @@ func main() {
 			"ok":              true,
 			"engine":          "ipatool-sap-bridge",
 			"secretProtected": bridgeSecret != "",
+			"sinfPatching":    true,
 		})
 	})
+
+	// Stream FairPlay SINF-patched .ipa (supports GET, HEAD, and HTTP Range for iOS OTA itunesstored)
+	servePatchedIpa := func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimSpace(r.PathValue("id"))
+		ticket, ok := ipaTickets.Get(id)
+		if !ok {
+			http.Error(w, "IPA download ticket expired or not found", http.StatusNotFound)
+			return
+		}
+		filePath, err := ticket.waitReady(r.Context(), ipaTickets.buildSem)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to prepare SINF-patched IPA: %v", err), http.StatusBadGateway)
+			return
+		}
+		f, err := os.Open(filePath)
+		if err != nil {
+			http.Error(w, "Patched IPA file no longer available; please inspect the app again", http.StatusGone)
+			return
+		}
+		defer f.Close()
+
+		stat, err := f.Stat()
+		if err != nil {
+			http.Error(w, "Failed to stat patched IPA", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", ticket.filename))
+		w.Header().Set("Cache-Control", "private, max-age=3600")
+		http.ServeContent(w, r, ticket.filename, stat.ModTime(), f)
+	}
+	// In Go 1.22+ ServeMux, a GET pattern natively matches both GET and HEAD requests
+	mux.HandleFunc("GET /v1/ipa/{id}/{filename}", servePatchedIpa)
 
 	mux.HandleFunc("POST /v1/auth/login", func(w http.ResponseWriter, r *http.Request) {
 		if !authorize(r, bridgeSecret) {
@@ -405,12 +650,9 @@ func main() {
 
 		pending2FA.Delete(email)
 
-		// Never echo the raw Apple ID password back over HTTP
 		acc := out.Account
 		acc.Password = ""
 
-		// Export provisioned Store AMD / Anisette state so the client's encrypted token
-		// works seamlessly even after Railway restarts or container migrations.
 		anisetteB64 := ""
 		if kc != nil {
 			if rawState, getErr := kc.Get(anisetteKeyName); getErr == nil && len(rawState) > 0 {
@@ -440,7 +682,8 @@ func main() {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "Invalid JSON body"})
 			return
 		}
-		appID, err := strconv.ParseInt(strings.TrimSpace(req.AppID), 10, 64)
+		appIDStr := strings.TrimSpace(req.AppID)
+		appID, err := strconv.ParseInt(appIDStr, 10, 64)
 		if err != nil || appID <= 0 {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "Invalid appID"})
 			return
@@ -499,7 +742,28 @@ func main() {
 			writeJSON(w, status, map[string]any{"code": code, "error": msg})
 			return
 		}
-		writeJSON(w, http.StatusOK, out)
+
+		resp := map[string]any{
+			"url":               out.URL,
+			"md5":               out.MD5,
+			"artworkUrl":        out.ArtworkURL,
+			"sinfCount":         out.SinfCount,
+			"metadata":          out.Metadata,
+			"availableVersions": out.AvailableVersions,
+			"externalVersionId": out.ExternalVersionID,
+		}
+
+		// Pre-build the FairPlay SINF + iTunesMetadata.plist patched .ipa in the background
+		// so both iOS OTA (itms-services://) and manual .ipa downloads launch cleanly on iPhone.
+		if !req.SkipPrepare && out.URL != "" {
+			if ticket, tErr := ipaTickets.Create(store, accountToUse, appIDStr, out); tErr == nil {
+				ticket.startBuildAsync(ipaTickets.buildSem)
+				resp["patchedDownloadId"] = ticket.id
+				resp["patchedFilename"] = ticket.filename
+			}
+		}
+
+		writeJSON(w, http.StatusOK, resp)
 	})
 
 	mux.HandleFunc("POST /v1/store/purchase", func(w http.ResponseWriter, r *http.Request) {

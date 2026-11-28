@@ -447,7 +447,7 @@ export interface SignedManifestPayload {
 }
 
 export function signManifestToken(payload: Omit<SignedManifestPayload, 'exp'>): string {
-  assertAppleCdnUrl(payload.ipaUrl);
+  assertSafeIpaDownloadUrl(payload.ipaUrl);
   if (payload.iconUrl) {
     assertSafeIconUrl(payload.iconUrl);
   }
@@ -482,7 +482,7 @@ export function verifyManifestToken(token: string): SignedManifestPayload | null
 
     const parsed = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as SignedManifestPayload;
     if (!parsed || Date.now() > parsed.exp) return null;
-    assertAppleCdnUrl(parsed.ipaUrl);
+    assertSafeIpaDownloadUrl(parsed.ipaUrl);
     if (parsed.iconUrl) {
       assertSafeIconUrl(parsed.iconUrl);
     }
@@ -566,6 +566,20 @@ export function assertAppleCdnUrl(raw: string): URL {
     throw new Error(`Домен ${host} не принадлежит официальным серверам Apple`);
   }
   return parsed;
+}
+
+const PATCHED_BRIDGE_IPA_PATH = /^\/v1\/ipa\/[0-9a-f]{64}\/[A-Za-z0-9._-]{1,120}\.ipa$/;
+
+export function assertSafeIpaDownloadUrl(raw: string): URL {
+  const parsed = assertSafeExternalHttpsUrl(raw);
+  const host = parsed.hostname.toLowerCase();
+  if (APPLE_CDN_SUFFIXES.some((suffix) => host.endsWith(suffix))) {
+    return parsed;
+  }
+  if (PATCHED_BRIDGE_IPA_PATH.test(parsed.pathname) && !parsed.search) {
+    return parsed;
+  }
+  throw new Error(`URL ${host} не разрешён для загрузки IPA`);
 }
 
 export function assertSafeIconUrl(raw: string): URL {

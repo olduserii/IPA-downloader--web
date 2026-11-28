@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 )
 
 type InspectDownloadOutput struct {
@@ -14,6 +15,7 @@ type InspectDownloadOutput struct {
 	Metadata          map[string]interface{} `json:"metadata"`
 	AvailableVersions []string               `json:"availableVersions"`
 	ExternalVersionID string                 `json:"externalVersionId"`
+	rawItem           downloadItemResult     `json:"-"`
 }
 
 func (t *appstore) InspectDownload(
@@ -118,5 +120,66 @@ func (t *appstore) InspectDownload(
 		Metadata:          item.Metadata,
 		AvailableVersions: versions,
 		ExternalVersionID: actualVer,
+		rawItem:           item,
 	}, nil
+}
+
+// BuildPatchedIPA downloads the raw Apple CDN IPA and applies the exact ipatool
+// binary iTunesMetadata.plist, iTunesArtwork, and FairPlay SC_Info/*.sinf patches
+// so installed apps launch natively on iOS without crashing.
+func (t *appstore) BuildPatchedIPA(
+	ctx context.Context,
+	acc Account,
+	out InspectDownloadOutput,
+	dstPath string,
+) error {
+	if out.URL == "" {
+		return errors.New("missing package download URL")
+	}
+	tmpRaw := dstPath + ".raw"
+	tmpSinf := dstPath + ".tmp"
+	_ = os.Remove(tmpRaw)
+	_ = os.Remove(tmpSinf)
+	_ = os.Remove(dstPath)
+
+	defer func() {
+		_ = os.Remove(tmpRaw)
+		_ = os.Remove(tmpSinf)
+	}()
+
+	if err := t.downloadFile(ctx, out.URL, tmpRaw, nil); err != nil {
+		return fmt.Errorf("failed to download raw ipa: %w", err)
+	}
+
+	var artwork []byte
+	if out.ArtworkURL != "" {
+		if art, artErr := t.downloadArtwork(ctx, out.ArtworkURL); artErr == nil {
+			artwork = art
+		}
+	}
+
+	itemCopy := out.rawItem
+	metaCopy := make(map[string]interface{}, len(out.rawItem.Metadata)+2)
+	for k, v := range out.rawItem.Metadata {
+		metaCopy[k] = v
+	}
+	itemCopy.Metadata = metaCopy
+
+	if err := t.applyPatches(itemCopy, acc, tmpRaw, dstPath, artwork); err != nil {
+		_ = os.Remove(dstPath)
+		return fmt.Errorf("failed to apply iTunesMetadata/artwork patches: %w", err)
+	}
+	_ = os.Remove(tmpRaw)
+
+	if len(itemCopy.Sinfs) > 0 {
+		if err := t.ReplicateSinf(ReplicateSinfInput{
+			PackagePath: dstPath,
+			Sinfs:       itemCopy.Sinfs,
+		}); err != nil {
+			_ = os.Remove(dstPath)
+			return fmt.Errorf("failed to inject FairPlay SINF: %w", err)
+		}
+	}
+
+	return nil
 }

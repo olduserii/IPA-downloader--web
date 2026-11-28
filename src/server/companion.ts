@@ -300,7 +300,8 @@ export async function bridgeInspectDownload(
   config: BridgeConfig,
   session: StoredAppleSession,
   appID: string,
-  externalVersionID = ''
+  externalVersionID = '',
+  opts?: { skipPrepare?: boolean }
 ): Promise<DownloadDescriptorResult> {
   if (!isValidAppId(appID)) {
     throw new Error('Некорректный App ID');
@@ -319,6 +320,7 @@ export async function bridgeInspectDownload(
         externalVersionID,
         guid: targetSession.guid,
         anisetteState: targetSession.anisetteState || undefined,
+        skipPrepare: Boolean(opts?.skipPrepare),
       }),
       redirect: 'manual',
       signal: AbortSignal.timeout(40000),
@@ -332,6 +334,8 @@ export async function bridgeInspectDownload(
       metadata?: Record<string, unknown>;
       availableVersions?: string[];
       externalVersionId?: string;
+      patchedDownloadId?: string;
+      patchedFilename?: string;
       code?: string;
       error?: string;
     };
@@ -428,8 +432,22 @@ export async function bridgeInspectDownload(
     userName: session.email,
   });
 
+  // Build the FairPlay SINF + iTunesMetadata.plist patched IPA URL served by the companion bridge.
+  // Raw Apple CDN IPAs lack SC_Info/*.sinf and crash immediately on launch on iOS!
+  let patchedIpaUrl: string | undefined;
+  if (
+    typeof data.patchedDownloadId === 'string' &&
+    /^[0-9a-f]{64}$/.test(data.patchedDownloadId) &&
+    typeof data.patchedFilename === 'string' &&
+    /^[A-Za-z0-9._-]{1,120}\.ipa$/.test(data.patchedFilename)
+  ) {
+    patchedIpaUrl = `${config.baseUrl}/v1/ipa/${data.patchedDownloadId}/${data.patchedFilename}`;
+  }
+
+  const effectiveIpaUrl = patchedIpaUrl || safeCdnUrl;
+
   const manifestToken = signManifestToken({
-    ipaUrl: safeCdnUrl,
+    ipaUrl: effectiveIpaUrl,
     bundleId: bundleID,
     bundleVersion: version,
     title: appName,
@@ -443,7 +461,9 @@ export async function bridgeInspectDownload(
     version,
     externalVersionID: actualVersionID,
     availableVersionIDs,
-    directCdnUrl: safeCdnUrl,
+    directCdnUrl: effectiveIpaUrl,
+    rawAppleCdnUrl: safeCdnUrl,
+    sinfPatched: Boolean(patchedIpaUrl),
     manifestToken,
     manifestPath: `/api/manifest.plist?token=${encodeURIComponent(manifestToken)}`,
     md5: data.md5 || undefined,
@@ -452,7 +472,7 @@ export async function bridgeInspectDownload(
     minOSVersion,
     sinfCount: typeof data.sinfCount === 'number' ? data.sinfCount : 0,
     metadataPlistXml,
-    endpointUsed: 'fairplay-sap-bridge',
+    endpointUsed: patchedIpaUrl ? 'fairplay-sap-bridge+sinf' : 'fairplay-sap-bridge',
     isDeletedDirect: false,
   };
 }
