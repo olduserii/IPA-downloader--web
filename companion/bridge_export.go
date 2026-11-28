@@ -35,6 +35,9 @@ func (t *appstore) InspectDownload(
 	app := App{ID: appID}
 
 	res, _, err := t.sendDownloadProduct(ctx, acc, app, guid, externalVersionID, PlatformIPhone)
+	if err == nil {
+		res.Data = normalizeDownloadFailure(res.Data)
+	}
 
 	// If the account had a wrong/stale pod prefix (e.g. legacy "25") and Apple rejected
 	// volumeStoreDownloadProduct with 2034/2042 or empty songList, retry on default host.
@@ -46,6 +49,9 @@ func (t *appstore) InspectDownload(
 		accNoPod := acc
 		accNoPod.Pod = ""
 		retryRes, _, retryErr := t.sendDownloadProduct(ctx, accNoPod, app, guid, externalVersionID, PlatformIPhone)
+		if retryErr == nil {
+			retryRes.Data = normalizeDownloadFailure(retryRes.Data)
+		}
 		if retryErr == nil && len(retryRes.Data.Items) > 0 {
 			res = retryRes
 			err = nil
@@ -67,6 +73,9 @@ func (t *appstore) InspectDownload(
 		if bag, bagErr := t.fetchURLBag(guid); bagErr == nil && bag.RedownloadEndpoint != "" {
 			if redownload, epErr := newDownloadEndpoint(bag.RedownloadEndpoint, redownloadProductPath); epErr == nil {
 				fallbackRes, fallbackErr := t.sendDelistedDownload(ctx, redownload, bag.EntDownloadEndpoint, acc, app, guid)
+				if fallbackErr == nil {
+					fallbackRes.Data = normalizeDownloadFailure(fallbackRes.Data)
+				}
 				if fallbackErr == nil && len(fallbackRes.Data.Items) > 0 {
 					res = fallbackRes
 					err = nil
@@ -78,7 +87,11 @@ func (t *appstore) InspectDownload(
 	if err != nil {
 		return InspectDownloadOutput{}, err
 	}
-	if res.Data.FailureType == FailureTypePasswordTokenExpired {
+	res.Data = normalizeDownloadFailure(res.Data)
+
+	if res.Data.FailureType == FailureTypePasswordTokenExpired ||
+		res.Data.FailureType == FailureTypeSignInRequired ||
+		res.Data.FailureType == FailureTypeDeviceVerificationFailed {
 		return InspectDownloadOutput{}, fmt.Errorf(
 			"%w (apple code=%s, pod=%q, message=%q)",
 			ErrPasswordTokenExpired,

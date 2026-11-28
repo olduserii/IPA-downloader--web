@@ -73,6 +73,7 @@ func formatGuidAsMac(guid string) string {
 // while also falling back to shared RAM state for fast same-container reuse.
 type memoryKeychain struct {
 	mu           sync.RWMutex
+	guid         string
 	data         map[string][]byte
 	sharedDevice *sharedAnisetteStore
 }
@@ -108,8 +109,10 @@ func (s *sharedAnisetteStore) Set(key string, val []byte) {
 
 var globalAnisette = newSharedAnisetteStore()
 
-func newMemoryKeychain(initialAnisette []byte) *memoryKeychain {
+func newMemoryKeychain(guid string, initialAnisette []byte) *memoryKeychain {
+	cleanGuid := strings.ToUpper(strings.TrimSpace(guid))
 	kc := &memoryKeychain{
+		guid:         cleanGuid,
 		data:         make(map[string][]byte),
 		sharedDevice: globalAnisette,
 	}
@@ -117,6 +120,9 @@ func newMemoryKeychain(initialAnisette []byte) *memoryKeychain {
 		cp := make([]byte, len(initialAnisette))
 		copy(cp, initialAnisette)
 		kc.data[anisetteKeyName] = cp
+		if cleanGuid != "" && kc.sharedDevice != nil {
+			kc.sharedDevice.Set(anisetteKeyName+":"+cleanGuid, cp)
+		}
 	}
 	return kc
 }
@@ -130,8 +136,8 @@ func (m *memoryKeychain) Get(key string) ([]byte, error) {
 		copy(cp, val)
 		return cp, nil
 	}
-	if key == anisetteKeyName && m.sharedDevice != nil {
-		if sharedVal, sharedOk := m.sharedDevice.Get(key); sharedOk {
+	if key == anisetteKeyName && m.sharedDevice != nil && m.guid != "" {
+		if sharedVal, sharedOk := m.sharedDevice.Get(anisetteKeyName + ":" + m.guid); sharedOk {
 			return sharedVal, nil
 		}
 	}
@@ -144,8 +150,8 @@ func (m *memoryKeychain) Set(key string, val []byte) error {
 	m.mu.Lock()
 	m.data[key] = cp
 	m.mu.Unlock()
-	if key == anisetteKeyName && m.sharedDevice != nil {
-		m.sharedDevice.Set(key, cp)
+	if key == anisetteKeyName && m.sharedDevice != nil && m.guid != "" {
+		m.sharedDevice.Set(anisetteKeyName+":"+m.guid, cp)
 	}
 	return nil
 }
@@ -216,8 +222,20 @@ func newActiveSessionCache() *activeSessionCache {
 	return &activeSessionCache{entries: make(map[string]pendingAuthEntry)}
 }
 
-func (c *activeSessionCache) Get(dsid string) (appstore.AppStore, *memoryKeychain, *appstore.Account, bool) {
-	key := strings.TrimSpace(dsid)
+func sessionCacheKey(dsid, guid string) string {
+	d := strings.TrimSpace(dsid)
+	g := strings.ToUpper(strings.TrimSpace(guid))
+	if d == "" {
+		return ""
+	}
+	if g != "" {
+		return d + "|" + g
+	}
+	return d
+}
+
+func (c *activeSessionCache) Get(dsid, guid string) (appstore.AppStore, *memoryKeychain, *appstore.Account, bool) {
+	key := sessionCacheKey(dsid, guid)
 	if key == "" {
 		return nil, nil, nil, false
 	}
@@ -237,7 +255,7 @@ func (c *activeSessionCache) Get(dsid string) (appstore.AppStore, *memoryKeychai
 }
 
 func (c *activeSessionCache) Put(dsid string, store appstore.AppStore, kc *memoryKeychain, guid string, acc *appstore.Account) {
-	key := strings.TrimSpace(dsid)
+	key := sessionCacheKey(dsid, guid)
 	if key == "" || store == nil {
 		return
 	}
@@ -252,7 +270,7 @@ func (c *activeSessionCache) Put(dsid string, store appstore.AppStore, kc *memor
 	c.entries[key] = pendingAuthEntry{
 		store:     store,
 		keychain:  kc,
-		guid:      guid,
+		guid:      strings.ToUpper(strings.TrimSpace(guid)),
 		account:   accCopy,
 		expiresAt: time.Now().Add(24 * time.Hour),
 	}
@@ -469,15 +487,15 @@ func newEphemeralStore(preferredGuid string, initialAnisette []byte) (appstore.A
 		return nil, nil, "", err
 	}
 	jar := &memoryCookieJar{Jar: rawJar}
-	kc := newMemoryKeychain(initialAnisette)
+	macAddr, _ := mach.MacAddress()
+	guid := strings.ReplaceAll(strings.ToUpper(macAddr), ":", "")
+	kc := newMemoryKeychain(guid, initialAnisette)
 	store := appstore.NewAppStore(appstore.Args{
 		CookieJar:       jar,
 		OperatingSystem: osSvc,
 		Keychain:        kc,
 		Machine:         mach,
 	})
-	macAddr, _ := mach.MacAddress()
-	guid := strings.ReplaceAll(strings.ToUpper(macAddr), ":", "")
 	return store, kc, guid, nil
 }
 
@@ -690,7 +708,7 @@ func main() {
 		}
 
 		providedAnisette := decodeAnisetteState(req.AnisetteState)
-		store, kc, cachedAcc, ok := activeSessions.Get(req.Account.DirectoryServicesID)
+		store, kc, cachedAcc, ok := activeSessions.Get(req.Account.DirectoryServicesID, req.GUID)
 		if !ok {
 			var guid string
 			store, kc, guid, err = newEphemeralStore(req.GUID, providedAnisette)
@@ -783,7 +801,7 @@ func main() {
 		}
 
 		providedAnisette := decodeAnisetteState(req.AnisetteState)
-		store, kc, cachedAcc, ok := activeSessions.Get(req.Account.DirectoryServicesID)
+		store, kc, cachedAcc, ok := activeSessions.Get(req.Account.DirectoryServicesID, req.GUID)
 		if !ok {
 			var guid string
 			store, kc, guid, err = newEphemeralStore(req.GUID, providedAnisette)
